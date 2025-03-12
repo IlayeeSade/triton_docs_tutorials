@@ -44,7 +44,7 @@ DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 # choose from later based on which one performs best on our specific GPU. Triton will figure out for us which one to use. They're 
 # all values chosen heuristically, but notice everything is a multiple of 32 in sticking w/ the number of threads in a warp.
 autotune_configs = [
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
+    #triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
@@ -54,7 +54,7 @@ autotune_configs = [
     triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
     triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=5, num_warps=8),
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=5, num_warps=4),
 ]
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator which consumes
@@ -63,7 +63,7 @@ autotune_configs = [
 #       that any time either M, N, or K changes with a new input, Triton will check which config is best all over again
 @triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
-def _matmul_kernel(
+def _rbf1_kernel(
     a_ptr, b_ptr, c_ptr, 
     M, N, K, 
     stride_a_M, stride_a_K, 
@@ -250,7 +250,8 @@ def _matmul_kernel(
             # fill in any masked-out parts with 0.0's since they don't have any effect on the summation in the next step
 
         # we accumulate along the K dimension
-        accumulator = tl.sum((a[:, None, :] - b[None, :, :]) ** 2, axis=2, acc=accumulator)
+        dist_matrix = (a[:, None, :] - b[None, :, :])
+        accumulator += tl.sum(dist_matrix * dist_matrix, axis=2)
             # triton is weird with operation notation; this is actually a tiny matmul not a dot product
             #   shape (BLOCK_SIZE_M, BLOCK_SIZE_K) @ (BLOCK_SIZE_K, BLOCK_SIZE_N) = (BLOCK_SIZE_M, BLOCK_SIZE_N)
             # `acc` tells Triton to write the output of the matmul directly to accumulator, which is more efficient than
@@ -455,9 +456,9 @@ def _rbf2_kernel(
         # we accumulate along the K dimension
         # || x - y || ^ 2 = || x || ^ 2 + || y || ^ 2 - 2<x,y>
         # a ** 2 (m, k) , summing over k-second dim.
-        accumulator = tl.sum((a * a), axis=1, acc=accumulator)
-        accumulator = tl.sum((b * b), axis=2, acc=accumulator)
-        accumulator = tl.dot(a, b, acc=accumulator * -1.0)
+        accumulator += tl.sum((a * a), axis=1)
+        accumulator += tl.sum((b * b), axis=2)
+        accumulator = tl.dot(a, b) -1.0 * accumulator 
         # triton is weird with operation notation; this is actually a tiny matmul not a dot product
         #   shape (BLOCK_SIZE_M, BLOCK_SIZE_K) @ (BLOCK_SIZE_K, BLOCK_SIZE_N) = (BLOCK_SIZE_M, BLOCK_SIZE_N)
         # `acc` tells Triton to write the output of the matmul directly to accumulator, which is more efficient than
@@ -474,7 +475,7 @@ def _rbf2_kernel(
 
 
 ######### Step 2 #########
-def matmul(a, b):
+def rbf1(a, b):
     # check constraints
     assert a.ndim == b.ndim == 2, "only supports matrices, not vectors or tensors"
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
@@ -493,7 +494,7 @@ def matmul(a, b):
     # Here instead we use a 1D launch kernel defined by cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
     # The reasoning behind this is explained inside the kernel
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
-    _matmul_kernel[grid](
+    _rbf1_kernel[grid](
         a, b, c,
         M, N, K,
         a.stride(0), a.stride(1),
@@ -530,7 +531,7 @@ def rbf2(a, b):
     )
     return c
 
-def rbf_kernel(x, y, gamma):
+def rbf_kernel(x, y):
     """
     Compute the RBF kernel matrix K(x, y) = exp(-gamma * ||x - y||^2)
     
@@ -546,11 +547,11 @@ def rbf_kernel(x, y, gamma):
     y_norm = torch.sum(y**2, dim=1, keepdim=True)  # Shape: (n, 1)
     dist_sq = x_norm - 2 * torch.mm(x, y.T) + y_norm.T  # Shape: (m, n)
 
-    return torch.exp(-gamma * dist_sq)
+    return torch.exp(-dist_sq)
 
 
 ######### Step 1 #########
-def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO does rtol=0 mean we don't use rtol?
+def test_rbf_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO does rtol=0 mean we don't use rtol?
     """
     Here is where we test the wrapper function and kernel that we wrote 
     above to ensure all our values are correct, using pytorch as the 
@@ -567,14 +568,14 @@ def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO
     a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     # run kernel & pytorch reference implementation
-    c_tri1 = matmul(a, b)
+    c_tri1 = rbf1(a, b)
     c_tri2 = rbf2(a, b)
     c_ref = rbf_kernel(a, b)
     # compare
     torch.testing.assert_close(c_tri1, c_ref, atol=atol, rtol=rtol)
-    print("PASSED")
+    print("PASSED1")
     torch.testing.assert_close(c_tri2, c_ref, atol=atol, rtol=rtol)
-    print("PASSED")
+    print("PASSED2")
 
 ######### Step 4 #########
 configs = [
@@ -582,11 +583,11 @@ configs = [
         x_names = ["M", "N", "K"], # we can increase multiple dimensions simultaneously while benchmarking
         x_vals = [128 * i for i in range(2, 33)],
         line_arg = "provider", 
-        line_vals = ["torch", "triton"],
-        line_names = ["PyTorch", "Triton"],
-        styles = [("green", "-"), ("blue", "-")],
+        line_vals = ["relu, matmul", "torch", "triton1", "triton2"],
+        line_names = ["Regular", "PyTorch", "Triton1", "Triton2"],
+        styles = [("orange", "-"), ("green", "-"), ("blue", "-"), ("red", "-")],
         ylabel = "TFLOPS", 
-        plot_name = "matmul-performance",
+        plot_name = "rbf-performance",
         args={},
     )
 ]
@@ -595,10 +596,14 @@ def benchmark(M, N, K, provider):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     quantiles = [0.5, 0.05, 0.95]
+    if provider == 'relu, matmul':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.nn.functional.relu(torch.matmul(a, b)), quantiles=quantiles)
     if provider == 'torch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf_kernel(a, b), quantiles=quantiles)
+    if provider == 'triton1':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf1(a, b), quantiles=quantiles)
+    if provider == 'triton2':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf2(a, b), quantiles=quantiles)
     perf = lambda ms: 3 * M * N * K * 1e-12 / (ms * 1e-3)
         # 3 = number of memory operations (2 read + 1 write)
         # M * N * K = number of elements per memory op
@@ -608,7 +613,7 @@ def benchmark(M, N, K, provider):
 
 if __name__ == "__main__":
     # always run unit-tests
-    test_matmul_kernel(size=(1024, 1024))
+    test_rbf_kernel(size=(1024, 1024))
 
     # Only run benchmark if explicitly requested
     import sys
