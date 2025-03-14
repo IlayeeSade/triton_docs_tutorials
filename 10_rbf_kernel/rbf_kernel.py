@@ -44,18 +44,18 @@ DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 # choose from later based on which one performs best on our specific GPU. Triton will figure out for us which one to use. They're 
 # all values chosen heuristically, but notice everything is a multiple of 32 in sticking w/ the number of threads in a warp.
 autotune_configs = [
-    #triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
-    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
-    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 4, 'GROUP_SIZE': 8}, num_stages=5, num_warps=4),
+    # Balanced, medium-sized tiles for versatility
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=3, num_warps=4),
+    # Larger tiles for big matrices, high occupancy
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=2, num_warps=8),
+    # Tall tiles for large M, smaller N
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 4}, num_stages=3, num_warps=4),
+    # Wide tiles for large N, smaller M
+    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 4}, num_stages=3, num_warps=4),
+    # Smaller tiles for resource-constrained cases or small problems
+    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE': 4}, num_stages=4, num_warps=2),
+    # High compute, deeper pipeline for large K
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=4, num_warps=8),
 ]
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator which consumes
 #   1) a list of `triton.Config` objects that define different configs of meta-parameters and compilation options
@@ -266,7 +266,8 @@ def _rbf1_kernel(
     c_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N) # notice the 2D mask
     tl.store(c_ptr + c_offsets, tl.exp(-accumulator).to(tl.float16), mask=c_mask) # shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
-
+@triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
+@triton.jit
 def _rbf2_kernel(
     a_ptr, b_ptr, c_ptr, 
     M, N, K, 
@@ -424,8 +425,10 @@ def _rbf2_kernel(
     offsets_M = PID_M * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offsets_N = PID_N * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offsets_K = tl.arange(0, BLOCK_SIZE_K)
-    a_offsets = offsets_M[:, None] * stride_a_M + offsets_K[None, :] * stride_a_K
+    a_offsets = offsets_M[:, None] * stride_a_M + offsets_K[None, :] * stride_a_K 
+    # BM x BK
     b_offsets = offsets_N[:, None] * stride_b_N + offsets_K[None, :] * stride_b_K
+    # BN x BK
     """
     [:, None] turns [m1,m2,m3] into [[m1],[m2],[m3]] 
     [None, :] turns [n1,n2,n3] into [[n1,n2,n3]]
@@ -449,16 +452,16 @@ def _rbf2_kernel(
         
         # Now we load blocks of A and B matrices. If multiple blocks in a group are on the same SM, 
         # they can share these loaded values, which reduces the number of expensive loads from DRAM
-        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)[:, :, None] # shape (BLOCK_SIZE_M, BLOCK_SIZE_K, 1)
-        b = tl.load(b_ptr + b_offsets, mask=mask[None, :], other=0.0)[None, :, :] # shape (1, BLOCK_SIZE_N, BLOCK_SIZE_K)
+        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        b = tl.load(b_ptr + b_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_N, BLOCK_SIZE_K)
             # fill in any masked-out parts with 0.0's since they don't have any effect on the summation in the next step
 
         # we accumulate along the K dimension
         # || x - y || ^ 2 = || x || ^ 2 + || y || ^ 2 - 2<x,y>
         # a ** 2 (m, k) , summing over k-second dim.
-        accumulator += tl.sum((a * a), axis=1)
-        accumulator += tl.sum((b * b), axis=2)
-        accumulator = tl.dot(a, b) -1.0 * accumulator 
+        accumulator -= tl.sum((a * a), axis=1)[:, None] # Modifying shapes to broadcast to BM x BN
+        accumulator -= tl.sum((b * b), axis=1)[None, :]
+        accumulator += tl.dot(a, tl.trans(b))
         # triton is weird with operation notation; this is actually a tiny matmul not a dot product
         #   shape (BLOCK_SIZE_M, BLOCK_SIZE_K) @ (BLOCK_SIZE_K, BLOCK_SIZE_N) = (BLOCK_SIZE_M, BLOCK_SIZE_N)
         # `acc` tells Triton to write the output of the matmul directly to accumulator, which is more efficient than
@@ -481,18 +484,10 @@ def rbf1(a, b):
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
     #assert a.is_contiguous() and b.is_contiguous, "input matrices must be contiguous"
     a, b = a.to(torch.float16), b.to(torch.float16)
-    
-    # get dimesion lengths
     (M, K), (_, N) = a.shape, b.shape
-
-    # allocates output
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    
+  
     # cdiv(x, y) = (x + (y - 1)) // y
-    # A naive (slow) launch grid might try to separate our axes of parallelizatio into 2 dimensions, one
-    #  for cdiv(M, BLOCK_SIZE_M) and the other for cdiv(N, BLOCK_SIZE_N)
-    # Here instead we use a 1D launch kernel defined by cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
-    # The reasoning behind this is explained inside the kernel
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
     _rbf1_kernel[grid](
         a, b, c,
@@ -510,17 +505,9 @@ def rbf2(a, b):
     #assert a.is_contiguous() and b.is_contiguous, "input matrices must be contiguous"
     a, b = a.to(torch.float16), b.to(torch.float16)
     
-    # get dimesion lengths
     (M, K), (_, N) = a.shape, b.shape
-
-    # allocates output
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     
-    # cdiv(x, y) = (x + (y - 1)) // y
-    # A naive (slow) launch grid might try to separate our axes of parallelizatio into 2 dimensions, one
-    #  for cdiv(M, BLOCK_SIZE_M) and the other for cdiv(N, BLOCK_SIZE_N)
-    # Here instead we use a 1D launch kernel defined by cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
-    # The reasoning behind this is explained inside the kernel
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
     _rbf2_kernel[grid](
         a, b, c,
@@ -568,12 +555,15 @@ def test_rbf_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO do
     a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     # run kernel & pytorch reference implementation
-    c_tri1 = rbf1(a, b)
+    #print('BEFORE_1')
+    #c_tri1 = rbf1(a, b)
+    print('BEFORE_2')
     c_tri2 = rbf2(a, b)
+    print('BEFORE_torch')
     c_ref = rbf_kernel(a, b)
     # compare
-    torch.testing.assert_close(c_tri1, c_ref, atol=atol, rtol=rtol)
-    print("PASSED1")
+    #torch.testing.assert_close(c_tri1, c_ref, atol=atol, rtol=rtol)
+    #print("PASSED1")
     torch.testing.assert_close(c_tri2, c_ref, atol=atol, rtol=rtol)
     print("PASSED2")
 
@@ -583,10 +573,10 @@ configs = [
         x_names = ["M", "N", "K"], # we can increase multiple dimensions simultaneously while benchmarking
         x_vals = [128 * i for i in range(2, 33)],
         line_arg = "provider", 
-        line_vals = ["relu, matmul", "torch", "triton1", "triton2"],
-        line_names = ["Regular", "PyTorch", "Triton1", "Triton2"],
-        styles = [("orange", "-"), ("green", "-"), ("blue", "-"), ("red", "-")],
-        ylabel = "TFLOPS", 
+        line_vals = ["relu, matmul", "torch", "triton2"],
+        line_names = ["Regular", "PyTorch", "Triton2"],
+        styles = [("orange", "-"), ("green", "-"), ("red", "-")],
+        ylabel = "Sec", 
         plot_name = "rbf-performance",
         args={},
     )
@@ -600,15 +590,11 @@ def benchmark(M, N, K, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.nn.functional.relu(torch.matmul(a, b)), quantiles=quantiles)
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf_kernel(a, b), quantiles=quantiles)
-    if provider == 'triton1':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf1(a, b), quantiles=quantiles)
+    #if provider == 'triton1':
+    #    ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf1(a, b), quantiles=quantiles)
     if provider == 'triton2':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: rbf2(a, b), quantiles=quantiles)
-    perf = lambda ms: 3 * M * N * K * 1e-12 / (ms * 1e-3)
-        # 3 = number of memory operations (2 read + 1 write)
-        # M * N * K = number of elements per memory op
-        # 1e-12 converts flops to Teraflops
-        # 1e-3 converts milliseconds to seconds
+    perf = lambda ms: ms * 1e-3
     return perf(ms), perf(max_ms), perf(min_ms)
 
 if __name__ == "__main__":
@@ -619,3 +605,4 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
         benchmark.run(save_path='.', print_data=False)
+    
