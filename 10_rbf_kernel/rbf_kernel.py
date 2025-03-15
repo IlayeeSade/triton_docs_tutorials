@@ -271,13 +271,17 @@ def _rbf1_kernel(
 def _rbf2_kernel(
     a_ptr, b_ptr, c_ptr, 
     M, N, K, 
-    stride_a_M, stride_a_K : tl.multiple_of(16), 
-    stride_b_K, stride_b_N : tl.multiple_of(16), 
-    stride_c_M, stride_c_N : tl.multiple_of(16),
+    stride_a_M, stride_a_K, 
+    stride_b_K, stride_b_N, 
+    stride_c_M, stride_c_N, 
     # meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr, 
 ):
+    
+    tl.static_assert(stride_a_K % 16 == 0)
+    tl.static_assert(stride_b_N % 16 == 0)
+    tl.static_assert(stride_c_N % 16 == 0)
     # we start with a 1D launch grid that we will turn into a 2D grid with a complicated "group-wise" ordering
     PID = tl.program_id(axis=0) 
     # defining the size of groups
@@ -343,7 +347,7 @@ def _rbf2_kernel(
         #   accumulator += tl.dot(a, b)
 
         # advance the pointers to the next block along K
-        a_offsets += BLOCK_SIZE_K * stride_a_K
+        a_offsets += BLOCK_SIZE_K * stride_a_K  
         b_offsets += BLOCK_SIZE_K * stride_b_K
 
     # write back the block of the output matrix C with masks
