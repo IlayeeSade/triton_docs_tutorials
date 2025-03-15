@@ -1,0 +1,38 @@
+properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
+NUM_SM = properties["multiprocessor_count"] 
+NUM_REGS = properties["max_num_regs"] 
+TOTAL_SRAM_PER_SM = properties["max_shared_mem"] 
+WARP_SIZE = properties["warpSize"]
+
+
+autotune_configs = [
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=4, num_warps=2),
+    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=2),
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': , 'GROUP_SIZE': 8}, num_stages=4, num_warps=2),
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE': 8}, num_stages=6, num_warps=4),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE': 8}, num_stages=8, num_warps=4),
+]   
+
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 16
+    # 128 x 128 x 16 = 262_144
+    GROUP_SIZE = 4
+    num_stages=4
+    num_warps=2
+
+    kernel = _rbf1_kernel.warmup(a, b, c,
+                                M, N, K,
+                                a.stride(0), a.stride(1),
+                                b.stride(0), b.stride(1),
+                                c.stride(0), c.stride(1),
+                                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                                GROUP_SIZE = GROUP_SIZE,
+                                grid=(1,))
+    kernel._init_handles()
+    n_regs = kernel.n_regs
+    sram_needed_per_program = kernel.metadata.shared 
