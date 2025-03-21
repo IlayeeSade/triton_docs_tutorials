@@ -4,7 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+import torch
+DEVICE = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
 
 @triton.jit
 def _seeded_dropout(
@@ -53,16 +54,15 @@ def seeded_dropout(x, p, seed):
     return output
 
 
-x = torch.randn(size=(10, 10), device=DEVICE)
+x = torch.randn(size=(3,3), device=DEVICE)
 # Compare this to the baseline - dropout mask is never instantiated!
 output = seeded_dropout(x, p=0.5, seed=123)
 output2 = seeded_dropout(x, p=0.5, seed=123)
 output3 = seeded_dropout(x, p=0.5, seed=512)
 
 print(
-    tabulate.tabulate([
-        ["input"] + x.tolist(),
-        ["output (seed = 123)"] + output.tolist(),
-        ["output (seed = 123)"] + output2.tolist(),
-        ["output (seed = 512)"] + output3.tolist(),
-    ]))
+        "input", x.tolist(),
+        "output (seed = 123)", output.tolist(),
+        "output (seed = 123)", output2.tolist(),
+        "output (seed = 512)", output3.tolist(),
+)
