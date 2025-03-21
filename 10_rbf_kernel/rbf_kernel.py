@@ -56,6 +56,8 @@ autotune_configs = [
     triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE': 4}, num_stages=4, num_warps=2),
     # High compute, deeper pipeline for large K
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=4, num_warps=8),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 4}, num_stages=4, num_warps=8),
+
 ]
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator which consumes
 #   1) a list of `triton.Config` objects that define different configs of meta-parameters and compilation options
@@ -278,10 +280,6 @@ def _rbf2_kernel(
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr, 
 ):
-    
-    tl.static_assert(stride_a_K % 16 == 0)
-    tl.static_assert(stride_b_N % 16 == 0)
-    tl.static_assert(stride_c_N % 16 == 0)
     # we start with a 1D launch grid that we will turn into a 2D grid with a complicated "group-wise" ordering
     PID = tl.program_id(axis=0) 
     # defining the size of groups
@@ -317,30 +315,32 @@ def _rbf2_kernel(
     # inputs tensors are fp16 but we accumulate into a block of fp32 values for higher accuracy (we'll revert later)
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32) # the full C is shape (M, N)
         # for a demonstration of why accumulation works, check out `./block_wise_matmul.png`
-        
+
+
+    # prefetching  
+    end = tl.cdiv(K, BLOCK_SIZE_K)
+    mask = offsets_K < K
+    a_next = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
+    b_next = tl.load(b_ptr + b_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_N, BLOCK_SIZE_K)
     # we'll iterate along the K dimension of both A and B to compute a single block of the C matrix
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(0, end):
         # out-of-bounds entries (along K) need to be masked out
         mask = offsets_K < K - k * BLOCK_SIZE_K
             # k * BLOCK_SIZE_K is the current starting index of offsets_k.
             # so this only really activates when k is within BLOCK_SIZE_K entries from K
             # meaning this gets triggered on the last iteration of the loop, and only if K is not a multiple of BLOCK_SIZE_K
-        
-        # Now we load blocks of A and B matrices. If multiple blocks in a group are on the same SM, 
-        # they can share these loaded values, which reduces the number of expensive loads from DRAM
-        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_ptr + b_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_N, BLOCK_SIZE_K)
+        a = a_next
+        b = b_next
+        if k + 1 != end:
+            a_next = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
+            b_next = tl.load(b_ptr + b_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_N, BLOCK_SIZE_K)
             # fill in any masked-out parts with 0.0's since they don't have any effect on the summation in the next step
         
-        if k + 1 < tl.cdiv(K, BLOCK_SIZE_K):
-            next_k_mask = offsets_K < K - (k+1) * BLOCK_SIZE_K
-            tl.prefetch(a_ptr + a_offsets + BLOCK_SIZE_K * stride_a_K, mask=next_k_mask[None, :])
-            tl.prefetch(b_ptr + b_offsets + BLOCK_SIZE_K * stride_b_K, mask=next_k_mask[None, :])
         # we accumulate along the K dimension
         # || x - y || ^ 2 = || x || ^ 2 + || y || ^ 2 - 2<x,y>
         # a ** 2 (m, k) , summing over k-second dim.
-        accumulator -= (tl.sum((a * a), axis=1)[:, None] + tl.sum((b * b), axis=1)[None, :]) # Modifying shapes to broadcast to BM x BN
-        accumulator += tl.dot(a, tl.trans(b))
+        accumulator -= (tl.sum(a * a, axis=1)[:, None] + tl.sum(b * b, axis=1)[None, :]) # Modifying shapes to broadcast to BM x BN
+        accumulator = tl.dot(a, tl.trans(b), acc=accumulator)
         # triton is weird with operation notation; this is actually a tiny matmul not a dot product
         #   shape (BLOCK_SIZE_M, BLOCK_SIZE_K) @ (BLOCK_SIZE_K, BLOCK_SIZE_N) = (BLOCK_SIZE_M, BLOCK_SIZE_N)
         # `acc` tells Triton to write the output of the matmul directly to accumulator, which is more efficient than
@@ -353,7 +353,7 @@ def _rbf2_kernel(
     # write back the block of the output matrix C with masks
     c_offsets = stride_c_M * offsets_M[:, None] + stride_c_N * offsets_N[None, :]
     c_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N) # notice the 2D mask
-    tl.store(c_ptr + c_offsets, tl.exp(accumulator - tl.max(accumulator)).to(tl.float16), mask=c_mask) # shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    tl.store(c_ptr + c_offsets, tl.exp(accumulator).to(tl.float16), mask=c_mask) # shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 ######### Step 2 #########
