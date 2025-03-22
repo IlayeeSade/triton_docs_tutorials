@@ -220,15 +220,11 @@ def _rbf2_kernel(
         # || x - y || ^ 2 = || x || ^ 2 + || y || ^ 2 - 2<x,y>
         # a ** 2 (m, k) , summing over k-second dim.
         accumulator -= (tl.sum(a * a, axis=1)[:, None] + tl.sum(b * b, axis=1)[None, :]) # Modifying shapes to broadcast to BM x BN
-        accumulator = tl.dot(a, tl.trans(b), acc=accumulator)
-        # triton is weird with operation notation; this is actually a tiny matmul not a dot product
-        #   shape (BLOCK_SIZE_M, BLOCK_SIZE_K) @ (BLOCK_SIZE_K, BLOCK_SIZE_N) = (BLOCK_SIZE_M, BLOCK_SIZE_N)
-        # `acc` tells Triton to write the output of the matmul directly to accumulator, which is more efficient than
-        #   accumulator += tl.dot(a, b)
+        accumulator = tl.dot(a, tl.trans(b), acc=accumulator) #( BM X BK @ BK X BN ) X 2
 
         # advance the pointers to the next block along K
-        a_offsets += BLOCK_SIZE_K * stride_a_K  
-        b_offsets += BLOCK_SIZE_K * stride_b_K
+        a_offsets += BLOCK_SIZE_K * stride_a_K   # BM X BK X 4 
+        b_offsets += BLOCK_SIZE_K * stride_b_K   # BK X BN X 4
 
     # write back the block of the output matrix C with masks
     c_offsets = stride_c_M * offsets_M[:, None] + stride_c_N * offsets_N[None, :]
@@ -505,7 +501,7 @@ def configs(data):
 
     properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
     NUM_SM = properties["multiprocessor_count"] 
-    NUM_REGS = properties["max_num_regs"] 
+    NUM_REGS = properties["max_num_regs"] # number of registers in an SM
     TOTAL_SRAM_PER_SM = properties["max_shared_mem"] 
     WARP_SIZE = properties["warpSize"]
     print(
@@ -536,7 +532,7 @@ def configs(data):
     sram_occupancy = TOTAL_SRAM_PER_SM // sram_needed_per_program
     programs_per_sm = min(reg_occupancy, sram_occupancy)
     num_programs_by_limit = NUM_SM * programs_per_sm
-    num_program_by_desire = num_PID_along_M * num_PID_along_N
+    num_programs_by_desire = num_PID_along_M * num_PID_along_N
     print(
         f"Registers per thread: {n_regs}\n"
         f"SRAM per program: {sram_needed_per_program} bytes\n"
@@ -544,10 +540,16 @@ def configs(data):
         f"SRAM occupancy: {sram_occupancy} programs per SM\n"
         f"Programs per SM: {programs_per_sm}\n"
         f"Total programs by hardware limit: {num_programs_by_limit}\n"
-        f"Total programs desired: {num_program_by_desire}"
+        f"Total programs desired: {num_programs_by_desire}"
     )
 
-    for _ in range(200):
+    print(
+        f"Register occupancy percentage: {((n_regs * WARP_SIZE * num_warps) / NUM_REGS) * 100:.1f}%\n" 
+        f"SRAM occupancy percentage: {(sram_needed_per_program / (TOTAL_SRAM_PER_SM / programs_per_sm)) * 100:.1f}%\n" 
+        f"Pipelining of Programs, current programs num vs simul programs: {(num_programs_by_limit / num_programs_by_desire) * 100:.1f}%"
+    )
+
+    for _ in range(1):
         grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
         _rbf_custom_kernel[grid](
             a, b, c,
