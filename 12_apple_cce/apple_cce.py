@@ -18,6 +18,13 @@ def _indexed_essential_probs_kernel(
     # Auto-tuned but want to use
     num_stages: tl.constexpr,
 ):
+    # Basically here we index into the Classifier = C, and using the embeddings of the i'th token, E_i
+    # We calculate C_{x_i} * E_i
+    # I divided E,C into blocks of N, these are for PIDs, then i divide within them into blocks of D
+    # Which I iterate over to calculate the dot product of  C_{x_i}, E_i
+
+
+
     pid = tl.program_id(axis=0)
     # I is of shape (N),
     n_dim_offset = pid * BLOCK_SIZE_N
