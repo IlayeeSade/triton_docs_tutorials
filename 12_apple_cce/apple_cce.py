@@ -213,12 +213,28 @@ def _lsemm_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
     mx1, mx2 = tl.zeros((1,), dtype=tl.float32), tl.zeros((1,), dtype=tl.float32)
+
+    mask_v = offsets_V < V
+    mask_n = offsets_N < N
         
     for d in range(0, tl.cdiv(D, BLOCK_SIZE_D)):
-        mask = offsets_D < D - d * BLOCK_SIZE_D
+        mask_d = offsets_D < D - d * BLOCK_SIZE_D
 
-        a = tl.load(c_ptr + a_offsets, mask=mask[None, :], other=0.0)
-        b = tl.load(e_ptr + b_offsets, mask=mask[:, None], other=0.0)
+        mask_a = mask_v[:, None] & mask_d[None, :]
+        mask_b = mask_d[:, None] & mask_n[None, :]
+
+        # Masked elements in the matmul that affect the final result
+        # Are the ones below the true elements in the result matrix
+        # and left to finish of the true elements
+        # So we can calculate this and remove their effect
+
+        # num_masked_v * (BN - num_masked_n), these are the number of those who have effect
+
+        num_masked_v = tl.sum(tl.logical_not(mask_v))
+        # num_nmasked_n = tl.sum(mask_n)
+
+        a = tl.load(c_ptr + a_offsets, mask=mask_a, other=0.0)
+        b = tl.load(e_ptr + b_offsets, mask=mask_b, other=0.0)
         
         # a @ b => (BV, BN) and we need to sum over BV
 
@@ -230,8 +246,13 @@ def _lsemm_kernel(
 
         guess_factor = 4
         mx1, mx2 = tl.max(a), tl.max(b)
+        correction_term = mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)
+                           
+        acc += tl.sum(tl.exp((tl.dot(a, b)) - correction_term), axis=0)
 
-        acc += tl.sum(tl.exp(tl.dot(a, b) - (mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)), axis=0))
+        correction_term = tl.exp(-correction_term) * num_masked_v
+        # Unlawfully adding themselved into the sum of the matrices
+        acc -= correction_term
 
         a_offsets += BLOCK_SIZE_D * stride_cd
         b_offsets += BLOCK_SIZE_D * stride_ed
@@ -244,9 +265,11 @@ def _lsemm_kernel(
     locks_ptr += PID_N * BLOCK_SIZE_N * stride_ll
     count_ptr = locks_ptr + L * num_PID_along_N * stride_ll
 
+    # Locking mechanism
     while tl.atomic_cas(locks_ptr, 0, 1) == 1:
         pass
 
+    # Saving useless addition
     count = tl.load(count_ptr)
     if count == 0:
         tl.atomic_xchg(count_ptr, 1)
