@@ -11,7 +11,11 @@ import argparse
 import torch
 DEVICE = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
 
-autotune_configs =[
+
+
+########## ALGORITHM (1) ###########
+
+autotune_configs_iep =[
         triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_D': 32, 'num_stages': 3, 'num_warps': 4}),
         triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_D': 32, 'num_stages': 3, 'num_warps': 8}),
         triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_D': 64, 'num_stages': 4, 'num_warps': 4}),
@@ -20,7 +24,7 @@ autotune_configs =[
         triton.Config({'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_D': 128, 'num_stages': 5, 'num_warps': 4}),
     ]
 
-@triton.autotune(configs = autotune_configs, key=['N', 'D', 'V'])
+@triton.autotune(configs = autotune_configs_iep, key=['N', 'D', 'V'])
 @triton.jit
 def _indexed_essential_probs_kernel(
     e_ptr, i_ptr, # contains the index of the correct label
@@ -165,6 +169,159 @@ def benchmark_indexed_essential_probs(shapes: tuple, device=DEVICE):
         'triton': (tri_ms, tri_min_ms, tri_max_ms),
         'torch': (torch_ms, torch_min_ms, torch_max_ms)
     }
+
+
+########## ALGORITHM (2) ###########
+# Log-Sum-Exp ( Matrix-Multiplication )
+
+@triton.autotune(configs = autotune_configs_lsemm, key=['N', 'D', 'V'])
+@triton.jit
+def _lsemm_kernel(
+    e_ptr, c_ptr, output_ptr, locks_ptr,
+    N, D, V, L,
+    stride_ed, stride_en,
+    stride_cv, stride_cd,
+    stride_on, stride_ll,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_D: tl.constexpr, BLOCK_SIZE_V: tl.constexpr,
+    GROUP_SIZE: tl.constexpr, 
+):
+    # We want to matmul (V, D) @ (D, N)
+
+
+    PID = tl.program_id(axis=0) 
+    
+    # Group-major ordering
+    num_PID_along_M = tl.cdiv(V, BLOCK_SIZE_V)
+    num_PID_along_N = tl.cdiv(N, BLOCK_SIZE_N)
+    num_PID_in_group = GROUP_SIZE * num_PID_along_N
+    group_id = PID // num_PID_in_group 
+    first_PID_in_group_along_M = group_id * GROUP_SIZE 
+    group_size_adj = min(num_PID_along_M - first_PID_in_group_along_M, GROUP_SIZE) 
+    PID_M = first_PID_in_group_along_M + ((PID % num_PID_in_group) % group_size_adj)
+    PID_N = (PID % num_PID_in_group) // group_size_adj
+
+    offsets_V = PID_M * BLOCK_SIZE_V + tl.arange(0, BLOCK_SIZE_V)
+    offsets_N = PID_N * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offsets_D = tl.arange(0, BLOCK_SIZE_D)
+    
+    # Reference
+    offsets_O = offsets_N
+    
+    
+    a_offsets = offsets_V[:, None] * stride_cv + offsets_D[None, :] * stride_cd # (BV, BD)
+    b_offsets = offsets_D[:, None] * stride_ed + offsets_N[None, :] * stride_en # (BD, BN)
+
+    acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    mx1, mx2 = tl.zeros((1,), dtype=tl.float32), tl.zeros((1,), dtype=tl.float32)
+        
+    for d in range(0, tl.cdiv(D, BLOCK_SIZE_D)):
+        mask = offsets_D < D - d * BLOCK_SIZE_D
+
+        a = tl.load(c_ptr + a_offsets, mask=mask[None, :], other=0.0)
+        b = tl.load(e_ptr + b_offsets, mask=mask[:, None], other=0.0)
+        
+        # a @ b => (BV, BN) and we need to sum over BV
+
+        # Given a maximum of a two matrices, their largest entry in their
+        # matmul is at most shared_dim * max1 * max2
+        # let's heuristically/randomly assume that for numerical stability and 
+        # there will be no problem of gradients, but the LR or something might need to compensate
+        # for the irregular order of the graidents.
+
+        guess_factor = 4
+        mx1, mx2 = tl.max(a), tl.max(b)
+
+        acc += tl.sum(tl.exp(tl.dot(a, b) - (mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)), axis=0))
+
+        a_offsets += BLOCK_SIZE_D * stride_cd
+        b_offsets += BLOCK_SIZE_D * stride_ed
+
+    acc = tl.log(acc)
+    
+    ointermediate_ptrs = output_ptr + offsets_O * stride_on
+    mask_o = (offsets_O < N)
+
+    locks_ptr += PID_N * BLOCK_SIZE_N * stride_ll
+    count_ptr = locks_ptr + L * num_PID_along_N * stride_ll
+
+    while tl.atomic_cas(locks_ptr, 0, 1) == 1:
+        pass
+
+    count = tl.load(count_ptr)
+    if count == 0:
+        tl.atomic_xchg(count_ptr, 1)
+    else:
+        acc += tl.load(ointermediate_ptrs, mask=mask_o)
+    
+    tl.store(ointermediate_ptrs, acc, mask=mask_o)
+    tl.atomic_xchg(locks_ptr, 0)
+
+
+######### Step 2 #########
+def matmul(a, b):
+    # check constraints
+    assert a.ndim == b.ndim == 2, "only supports matrices, not vectors or tensors"
+    assert a.shape[1] == b.shape[0], "incompatible dimensions"
+    #assert a.is_contiguous() and b.is_contiguous, "input matrices must be contiguous"
+    a, b = a.to(torch.float16), b.to(torch.float16)
+    
+    # get dimesion lengths
+    (M, K), (_, N) = a.shape, b.shape
+    locks = torch.zeros(2 * meta['BLOCK_SIZE_N'], dtype=torch.int32, device=DEVICE)
+
+    # allocates output
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    
+    # cdiv(x, y) = (x + (y - 1)) // y
+    # A naive (slow) launch grid might try to separate our axes of parallelizatio into 2 dimensions, one
+    #  for cdiv(M, BLOCK_SIZE_M) and the other for cdiv(N, BLOCK_SIZE_N)
+    # Here instead we use a 1D launch kernel defined by cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
+    # The reasoning behind this is explained inside the kernel
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
+    _matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c
+
+######### Step 1 #########
+def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO does rtol=0 mean we don't use rtol?
+    # create input data
+    torch.manual_seed(0)
+    assert type(size) == tuple and len(size) == 2
+    a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    # run kernel & pytorch reference implementation
+    c_tri = matmul(a, b)
+    c_ref = torch.matmul(a, b)
+    # compare
+    torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
+    print("PASSED")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # Add more comprehensive benchmarking with triton.testing.perf_report
