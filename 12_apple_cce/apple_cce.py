@@ -222,9 +222,9 @@ def _lsemm_kernel(
     b_offsets = offsets_D[:, None] * stride_ed + offsets_N[None, :] * stride_en # (BD, BN)
 
     acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-    block_cmx = tl.zeros((1,), dtype=tl.float32) # current max
-    block_gmx = tl.zeros((1,), dtype=tl.float32) # global max of block currently
-    cexpc, cexpg = tl.zeros((1,), dtype=tl.float32), tl.zeros((1,), dtype=tl.float32) # correcting shit later
+    block_cmx = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # current max
+    block_gmx = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # global max of block currently
+    cexpc, cexpg = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32), tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # correcting shit later
     # These are multipliers that affect exisiting sums to make their max-num precision subtraction
     # global, to take the largest max
 
@@ -283,12 +283,14 @@ def _lsemm_kernel(
     mask_m = (offsets_M < N)
     mask_o = (offsets_O < N)
 
-    locks_ptr += PID_N * BLOCK_SIZE_N * stride_ll
     # count_ptr = locks_ptr + L * num_PID_along_N * stride_ll
+    lock_id = PID_N * BLOCK_SIZE_N
+    locked = 1
+    while locked == 1:
+        locked = tl.atomic_cas(locks_ptr + lock_id * stride_ll, 0, 1)
+        # Optional: Add a small delay to prevent tight spinning
+        tl.debug_barrier()  
 
-    # Locking mechanism
-    while tl.atomic_cas(locks_ptr, 0, 1) == 1:
-        pass
 
     # Saving useless addition
     # count = tl.load(count_ptr)
@@ -319,8 +321,6 @@ def _lsemm_kernel(
 def lsemm(E, C):
     assert C.ndim == E.ndim == 2, "only supports matrices, not vectors or tensors"
     assert C.shape[1] == E.shape[0], "incompatible dimensions"
-    
-    BLOCK_SIZE_N=64, BLOCK_SIZE_D=32, BLOCK_SIZE_V=32, GROUP_SIZE=8, num_stages=3
 
     (D, N), (V, _) = E.shape, C.shape
     O = torch.full((N,), float('-inf'), device=E.device, dtype=torch.float32)
@@ -336,7 +336,6 @@ def lsemm(E, C):
         C.stride(0), C.stride(1),
         O.stride(0), locks.stride(0),
         M.stride(0),
-        BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_D=BLOCK_SIZE_D, BLOCK_SIZE_V=BLOCK_SIZE_V, GROUP_SIZE=GROUP_SIZE, num_stages=num_stages
     )
     # Now add the maxes changes and log it
     return torch.log(O) + M
