@@ -72,15 +72,36 @@ def indexed_essential_probs(E, C, I):
     return O
 
 
-x = torch.randn(size=(3,3), device=DEVICE)
-# Compare this to the baseline - dropout mask is never instantiated!
-output = indexed_essential_probs(x, p=0.5, seed=123)
-output2 = indexed_essential_probs(x, p=0.5, seed=123)
-output3 = indexed_essential_probs(x, p=0.5, seed=512)
+def torch_indexed_essential_probs(E, C, I, use_vectorized=True):
+    N = I.shape[0]
+    if use_vectorized:
+        indexed_C = C[I]
+        E_t = E.T
+        O = (indexed_C * E_t).sum(dim=1)
+    else:
+        for i in range(N):
+            idx = I[i]
+            c_row = C[idx]
+            # Get the i-th column from E
+            e_col = E[:, i]
+            O[i] = torch.dot(c_row, e_col)
+    return O
 
-print(
-        "input", x.tolist(),
-        "output (seed = 123)", output.tolist(),
-        "output (seed = 123)", output2.tolist(),
-        "output (seed = 512)", output3.tolist(),
-)
+def test_indexed_essential_probs(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
+    # create input data
+    torch.manual_seed(0)
+    assert type(shapes) == tuple and len(shapes) == 3
+    N, D, V = shapes
+    E, C, O, I = torch.randn([D, N]), torch.randn([V, D]), torch.empty([N]), torch.randint(high=V, size=(N,))
+
+    a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    # run kernel & pytorch reference implementation
+    c_tri = indexed_essential_probs(E, C, I)
+    c_ref = torch_indexed_essential_probs(E, C, I)
+    # compare
+    torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
+    print("PASSED")
+
+if __name__ == "__main__":
+    test_indexed_essential_probs(shapes=(1024, 1024, 1024))
