@@ -187,17 +187,16 @@ autotune_configs_lsemm = [
 @triton.autotune(configs=autotune_configs_lsemm, key=['N', 'D', 'V'])
 @triton.jit
 def _lsemm_kernel(
-    e_ptr, c_ptr, output_ptr, locks_ptr,
+    e_ptr, c_ptr, output_ptr, locks_ptr, maxes_ptr,
     N, D, V, L,
     stride_ed, stride_en,
     stride_cv, stride_cd,
     stride_on, stride_ll,
+    stride_miv,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_D: tl.constexpr, BLOCK_SIZE_V: tl.constexpr,
     GROUP_SIZE: tl.constexpr,  num_stages: tl.constexpr,
 ):
-    # We want to matmul (V, D) @ (D, N)
-
-
+    # We want to matmul (V, D) @ (D, N) and the sum over the V axis
     PID = tl.program_id(axis=0) 
     
     # Group-major ordering
@@ -216,13 +215,18 @@ def _lsemm_kernel(
     
     # Reference
     offsets_O = offsets_N
+    offsets_M = offsets_N
     
     
     a_offsets = offsets_V[:, None] * stride_cv + offsets_D[None, :] * stride_cd # (BV, BD)
     b_offsets = offsets_D[:, None] * stride_ed + offsets_N[None, :] * stride_en # (BD, BN)
 
     acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-    mx1, mx2 = tl.zeros((1,), dtype=tl.float32), tl.zeros((1,), dtype=tl.float32)
+    block_cmx = tl.zeros((1,), dtype=tl.float32) # current max
+    block_gmx = tl.zeros((1,), dtype=tl.float32) # global max of block currently
+    cexpc, cexpg = tl.zeros((1,), dtype=tl.float32), tl.zeros((1,), dtype=tl.float32) # correcting shit later
+    # These are multipliers that affect exisiting sums to make their max-num precision subtraction
+    # global, to take the largest max
 
     mask_v = offsets_V < V
     mask_n = offsets_N < N
@@ -258,58 +262,84 @@ def _lsemm_kernel(
             # mx1, mx2 = tl.max(a), tl.max(b)
             # correction_term = mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)
                            
-        matmul_res = tl.dot(a, b)
-        correction_term = tl.max(matmul_res)
+        matmul_res = tl.dot(a, b) # (BLOCK_SIZE_V, BLOCK_SIZE_N)
+        block_cmx = tl.max(matmul_res, axis=0)
+    
+        acc += tl.sum(tl.exp(matmul_res - block_cmx), axis=0) # (BN,) 
 
-        acc += tl.sum(tl.exp(matmul_res - correction_term), axis=0)
-
-        correction_term = tl.exp(-correction_term) * num_masked_v
+        correction_term = tl.exp(-block_cmx) * num_masked_v
         # Unlawfully adding themselved into the sum of the matrices
         acc -= correction_term
 
         a_offsets += BLOCK_SIZE_D * stride_cd
         b_offsets += BLOCK_SIZE_D * stride_ed
+
+    # Now acc holds sum(exp(z_i - block_cmx))) while the real result is
+    # log(sum(exp(z_i - block_cmx))) + block_cmx
     
+    maxes_ptrs = maxes_ptr + offsets_M * stride_miv
     ointermediate_ptrs = output_ptr + offsets_O * stride_on
+    
+    mask_m = (offsets_M < N)
     mask_o = (offsets_O < N)
 
     locks_ptr += PID_N * BLOCK_SIZE_N * stride_ll
-    count_ptr = locks_ptr + L * num_PID_along_N * stride_ll
+    # count_ptr = locks_ptr + L * num_PID_along_N * stride_ll
 
     # Locking mechanism
     while tl.atomic_cas(locks_ptr, 0, 1) == 1:
         pass
 
     # Saving useless addition
-    count = tl.load(count_ptr)
-    if count == 0:
-        tl.atomic_xchg(count_ptr, 1)
-    else:
-        acc += tl.exp(tl.load(ointermediate_ptrs, mask=mask_o))
-    
-    acc = tl.log(acc)
-    tl.store(ointermediate_ptrs, acc, mask=mask_o)
-    tl.atomic_xchg(locks_ptr, 0)
+    # count = tl.load(count_ptr)
+    # if count == 0:
+    #     tl.atomic_xchg(count_ptr, 1)
+    # else:
+
+    # We basically keep the maximum here at all times
+    block_gmx = tl.load(maxes_ptrs, mask=mask_m, other=float('-inf'))
+    block_acc = tl.load(ointermediate_ptrs, mask=mask_o) # Holds log(sum(exp(z_block - block_gmx)))
+    # block_acc = tl.exp(block_acc) # block_acc holds sum(exp(z_block - block_gmx))
+
+    cexpc, cexpg = tl.exp(block_cmx - block_gmx), tl.exp(block_gmx - block_cmx)
+    keep_mask = block_gmx >= block_cmx
+    block_gmx = tl.where(keep_mask, block_gmx, block_cmx)
+    block_acc = tl.where(keep_mask, acc * cexpc, block_acc * cexpg)
+    # depending on the mask, (1) if gmx greater/equal, (2) else
+    # (1) Now acc holds sum(exp(z_i - block_gmx)) , shape (BLOCK_SIZE_N,)
+    # (2) Now block_acc holds sum(exp(z_block - block_cmx)), shape(BLOCK_SIZE_N)
+    acc = tl.where(keep_mask, block_acc, acc)
+    block_acc = acc + block_acc 
+    # Now everything is summed and holds the max, not holds, more like holds the effect
+    tl.store(ointermediate_ptrs, block_acc, mask=mask_o)
+    tl.store(maxes_ptrs, block_gmx, mask=mask_m) # Store the maxes of the maxes of the block
+    tl.atomic_xchg(locks_ptr, 0) # Unlock
 
 
 def lsemm(E, C):
     assert C.ndim == E.ndim == 2, "only supports matrices, not vectors or tensors"
     assert C.shape[1] == E.shape[0], "incompatible dimensions"
     
+    BLOCK_SIZE_N=64, BLOCK_SIZE_D=32, BLOCK_SIZE_V=32, GROUP_SIZE=8, num_stages=3
+
     (D, N), (V, _) = E.shape, C.shape
-    O = torch.empty((N,), device=E.device, dtype=torch.float32)
+    O = torch.full((N,), float('-inf'), device=E.device, dtype=torch.float32)
+    M = torch.full((N,), float('-inf'), device=E.device, dtype=torch.float32)
     L = N // 32  # We assume the block size is larger than that and we will have enough locks
     locks = torch.zeros(2 * L, dtype=torch.int32, device=E.device)
     
     grid = lambda meta: (triton.cdiv(V, meta['BLOCK_SIZE_V']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
     _lsemm_kernel[grid](
         E, C, O, locks,
-        N, D, V, L,
+        N, D, V, L, M,
         E.stride(0), E.stride(1),
         C.stride(0), C.stride(1),
         O.stride(0), locks.stride(0),
+        M.stride(0),
+        BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_D=BLOCK_SIZE_D, BLOCK_SIZE_V=BLOCK_SIZE_V, GROUP_SIZE=GROUP_SIZE, num_stages=num_stages
     )
-    return O
+    # Now add the maxes changes and log it
+    return torch.log(O) + M
 
 @torch.compile
 def torch_lsemm(E, C):
@@ -317,10 +347,10 @@ def torch_lsemm(E, C):
     assert C.shape[1] == E.shape[0], "incompatible dimensions"
 
     RES = C @ E  # (V, D) @ (D, N) = (V, N)
-    mx = torch.max(RES)
-    RES -= mx
-    RES = torch.sum(torch.exp(RES), axis=0)
-    return torch.log(RES)
+    mx = torch.max(RES, dim=0, keepdim=True)[0]  # Shape: (1, N)
+    RES = RES - mx  # Broadcasting: (V, N) - (1, N)
+    RES = torch.sum(torch.exp(RES), dim=0)  # Sum over V dimension, result shape: (N,)
+    return torch.log(RES) + mx.squeeze(0)  # Add back the maxes
 
 def test_lsemm(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
     # create input data
