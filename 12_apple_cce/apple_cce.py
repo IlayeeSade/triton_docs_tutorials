@@ -108,21 +108,9 @@ def indexed_essential_probs(E, C, I):
     return O
 
 
-def torch_indexed_essential_probs(E, C, I, use_vectorized=True):
-    N = I.shape[0]
-    if use_vectorized:
-        indexed_C = C[I]
-        E_t = E.T
-        O = (indexed_C * E_t).sum(dim=1)
-    else:
-        O = torch.empty(N, device=I.device)
-        for i in range(N):
-            idx = I[i]
-            c_row = C[idx]
-            # Get the i-th column from E
-            e_col = E[:, i]
-            O[i] = torch.dot(c_row, e_col)
-    return O
+def torch_indexed_essential_probs(E, C, I):
+    # Vectorized approach: batch matrix-vector multiplication
+    return torch.einsum('ij,ij->i', C[I], E.T)
 
 def test_indexed_essential_probs(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
     # create input data
@@ -162,29 +150,20 @@ def benchmark_indexed_essential_probs(shapes: tuple, device=DEVICE):
     )
     
     torch_ms, torch_min_ms, torch_max_ms = triton.testing.do_bench(
-        lambda: torch_indexed_essential_probs(E, C, I, use_vectorized=True), 
-        quantiles=quantiles
-    )
-    
-    torch_non_vec_ms, torch_non_vec_min_ms, torch_non_vec_max_ms = triton.testing.do_bench(
-        lambda: torch_indexed_essential_probs(E, C, I, use_vectorized=False), 
+        lambda: torch_indexed_essential_probs(E, C, I), 
         quantiles=quantiles
     )
     
     print(f"Shape: N={N}, D={D}, V={V}")
     print(f"Triton: {tri_ms:.3f}ms (min: {tri_min_ms:.3f}ms, max: {tri_max_ms:.3f}ms)")
-    print(f"PyTorch Vectorized: {torch_ms:.3f}ms (min: {torch_min_ms:.3f}ms, max: {torch_max_ms:.3f}ms)")
-    print(f"PyTorch Non-Vectorized: {torch_non_vec_ms:.3f}ms (min: {torch_non_vec_min_ms:.3f}ms, max: {torch_non_vec_max_ms:.3f}ms)")
+    print(f"PyTorch: {torch_ms:.3f}ms (min: {torch_min_ms:.3f}ms, max: {torch_max_ms:.3f}ms)")
     
-    speedup_vs_vec = torch_ms / tri_ms
-    speedup_vs_nonvec = torch_non_vec_ms / tri_ms
-    print(f"Speedup vs PyTorch Vectorized: {speedup_vs_vec:.2f}x")
-    print(f"Speedup vs PyTorch Non-Vectorized: {speedup_vs_nonvec:.2f}x")
+    speedup = torch_ms / tri_ms
+    print(f"Speedup vs PyTorch: {speedup:.2f}x")
     
     return {
         'triton': (tri_ms, tri_min_ms, tri_max_ms),
-        'torch_vec': (torch_ms, torch_min_ms, torch_max_ms),
-        'torch_non_vec': (torch_non_vec_ms, torch_non_vec_min_ms, torch_non_vec_max_ms)
+        'torch': (torch_ms, torch_min_ms, torch_max_ms)
     }
 
 
@@ -194,9 +173,9 @@ configs = [
         x_names=["N"],  # We'll vary sequence length
         x_vals=[128 * i for i in range(1, 17)],  # From 128 to 2048
         line_arg="provider",
-        line_vals=["triton", "torch_vec", "torch_non_vec"],
-        line_names=["Triton", "PyTorch Vectorized", "PyTorch Non-Vectorized"],
-        styles=[("red", "-"), ("blue", "-"), ("green", "--")],
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-")],
         ylabel="Execution Time (ms)",
         plot_name="apple-cce-performance-N",
         args={"D": 512, "V": 2048},  # Fixed dimensions
@@ -205,9 +184,9 @@ configs = [
         x_names=["D"],  # We'll vary embedding dimension
         x_vals=[128 * i for i in range(1, 9)],  # From 128 to 1024
         line_arg="provider",
-        line_vals=["triton", "torch_vec", "torch_non_vec"],
-        line_names=["Triton", "PyTorch Vectorized", "PyTorch Non-Vectorized"],
-        styles=[("red", "-"), ("blue", "-"), ("green", "--")],
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-")],
         ylabel="Execution Time (ms)",
         plot_name="apple-cce-performance-D",
         args={"N": 512, "V": 2048},  # Fixed dimensions
@@ -216,9 +195,9 @@ configs = [
         x_names=["V"],  # We'll vary vocabulary size
         x_vals=[1000 * i for i in range(1, 11)],  # From 1000 to 10000
         line_arg="provider",
-        line_vals=["triton", "torch_vec", "torch_non_vec"],
-        line_names=["Triton", "PyTorch Vectorized", "PyTorch Non-Vectorized"],
-        styles=[("red", "-"), ("blue", "-"), ("green", "--")],
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-")],
         ylabel="Execution Time (ms)",
         plot_name="apple-cce-performance-V",
         args={"N": 512, "D": 512},  # Fixed dimensions
@@ -241,14 +220,9 @@ def benchmark(N, D, V, provider):
             lambda: indexed_essential_probs(E, C, I), 
             quantiles=quantiles
         )
-    elif provider == 'torch_vec':
+    elif provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: torch_indexed_essential_probs(E, C, I, use_vectorized=True), 
-            quantiles=quantiles
-        )
-    elif provider == 'torch_non_vec':
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: torch_indexed_essential_probs(E, C, I, use_vectorized=False), 
+            lambda: torch_indexed_essential_probs(E, C, I), 
             quantiles=quantiles
         )
     else:
@@ -325,8 +299,8 @@ def run_basic_benchmarks():
     results = {
         'Shape': [],
         'N': [], 'D': [], 'V': [],
-        'Triton (ms)': [], 'PyTorch Vec (ms)': [], 'PyTorch Non-Vec (ms)': [],
-        'Speedup vs Vec': [], 'Speedup vs Non-Vec': []
+        'Triton (ms)': [], 'PyTorch (ms)': [],
+        'Speedup': []
     }
     
     for shape in shapes:
@@ -337,12 +311,10 @@ def run_basic_benchmarks():
         
         # Extract timing values
         tri_ms = timings['triton'][0]
-        torch_vec_ms = timings['torch_vec'][0]
-        torch_non_vec_ms = timings['torch_non_vec'][0]
+        torch_ms = timings['torch'][0]
         
-        # Calculate speedups
-        speedup_vs_vec = torch_vec_ms / tri_ms
-        speedup_vs_nonvec = torch_non_vec_ms / tri_ms
+        # Calculate speedup
+        speedup = torch_ms / tri_ms
         
         # Store results
         results['Shape'].append(shape_str)
@@ -350,10 +322,8 @@ def run_basic_benchmarks():
         results['D'].append(D)
         results['V'].append(V)
         results['Triton (ms)'].append(f"{tri_ms:.2f}")
-        results['PyTorch Vec (ms)'].append(f"{torch_vec_ms:.2f}")
-        results['PyTorch Non-Vec (ms)'].append(f"{torch_non_vec_ms:.2f}")
-        results['Speedup vs Vec'].append(f"{speedup_vs_vec:.2f}x")
-        results['Speedup vs Non-Vec'].append(f"{speedup_vs_nonvec:.2f}x")
+        results['PyTorch (ms)'].append(f"{torch_ms:.2f}")
+        results['Speedup'].append(f"{speedup:.2f}x")
     
     # Export results to CSV
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -370,8 +340,7 @@ def run_basic_benchmarks():
         N, D, V = shape
         print(f"Shape ({results['Shape'][i]}):")
         print(f"  Triton: {results['Triton (ms)'][i]}ms")
-        print(f"  PyTorch Vec: {results['PyTorch Vec (ms)'][i]}ms (speedup: {results['Speedup vs Vec'][i]})")
-        print(f"  PyTorch Non-Vec: {results['PyTorch Non-Vec (ms)'][i]}ms (speedup: {results['Speedup vs Non-Vec'][i]})")
+        print(f"  PyTorch: {results['PyTorch (ms)'][i]}ms (speedup: {results['Speedup'][i]})")
 
 
 def run_detailed_benchmarks(show_plots=False):
@@ -394,18 +363,15 @@ def run_detailed_benchmarks(show_plots=False):
         # Initialize data containers
         data = {
             'triton': [],
-            'torch_vec': [],
-            'torch_non_vec': []
+            'torch': []
         }
         
         # Collect data for CSV
         csv_data = {
             x_name: [],
             'Triton (ms)': [],
-            'PyTorch Vec (ms)': [],
-            'PyTorch Non-Vec (ms)': [],
-            'Speedup vs Vec': [],
-            'Speedup vs Non-Vec': []
+            'PyTorch (ms)': [],
+            'Speedup': []
         }
         
         # Run benchmarks for each x value
@@ -435,30 +401,21 @@ def run_detailed_benchmarks(show_plots=False):
                 quantiles=quantiles
             )
             
-            # PyTorch vectorized
-            torch_vec_ms, torch_vec_min_ms, torch_vec_max_ms = triton.testing.do_bench(
-                lambda: torch_indexed_essential_probs(E, C, I, use_vectorized=True), 
-                quantiles=quantiles
-            )
-            
-            # PyTorch non-vectorized
-            torch_non_vec_ms, torch_non_vec_min_ms, torch_non_vec_max_ms = triton.testing.do_bench(
-                lambda: torch_indexed_essential_probs(E, C, I, use_vectorized=False), 
+            # PyTorch
+            torch_ms, torch_min_ms, torch_max_ms = triton.testing.do_bench(
+                lambda: torch_indexed_essential_probs(E, C, I), 
                 quantiles=quantiles
             )
             
             # Store results
             data['triton'].append((x_val, tri_ms))
-            data['torch_vec'].append((x_val, torch_vec_ms))
-            data['torch_non_vec'].append((x_val, torch_non_vec_ms))
+            data['torch'].append((x_val, torch_ms))
             
             # Store CSV data
             csv_data[x_name].append(x_val)
             csv_data['Triton (ms)'].append(f"{tri_ms * 1000:.2f}")
-            csv_data['PyTorch Vec (ms)'].append(f"{torch_vec_ms * 1000:.2f}")
-            csv_data['PyTorch Non-Vec (ms)'].append(f"{torch_non_vec_ms * 1000:.2f}")
-            csv_data['Speedup vs Vec'].append(f"{torch_vec_ms/tri_ms:.2f}x")
-            csv_data['Speedup vs Non-Vec'].append(f"{torch_non_vec_ms/tri_ms:.2f}x")
+            csv_data['PyTorch (ms)'].append(f"{torch_ms * 1000:.2f}")
+            csv_data['Speedup'].append(f"{torch_ms/tri_ms:.2f}x")
         
         # Save results for this config
         results[config_name] = data
@@ -484,14 +441,12 @@ def create_matplotlib_plots(data, x_name, timestamp):
     # Extract data
     x_vals = [point[0] for point in data['triton']]
     triton_times = [point[1] * 1000 for point in data['triton']]  # Convert to ms
-    torch_vec_times = [point[1] * 1000 for point in data['torch_vec']]
-    torch_non_vec_times = [point[1] * 1000 for point in data['torch_non_vec']]
+    torch_times = [point[1] * 1000 for point in data['torch']]
     
     # Create performance plot
     plt.figure(figsize=(10, 6), dpi=150)
     plt.plot(x_vals, triton_times, 'ro-', label='Triton', linewidth=2)
-    plt.plot(x_vals, torch_vec_times, 'bo-', label='PyTorch Vectorized', linewidth=2)
-    plt.plot(x_vals, torch_non_vec_times, 'g--', label='PyTorch Non-Vectorized', linewidth=2, marker='s')
+    plt.plot(x_vals, torch_times, 'bo-', label='PyTorch', linewidth=2)
     
     # Add labels and title
     plt.xlabel(x_name, fontsize=12)
@@ -513,12 +468,10 @@ def create_matplotlib_plots(data, x_name, timestamp):
     plt.figure(figsize=(10, 6), dpi=150)
     
     # Calculate speedups
-    vec_speedups = [vec/tri for vec, tri in zip(torch_vec_times, triton_times)]
-    non_vec_speedups = [nonvec/tri for nonvec, tri in zip(torch_non_vec_times, triton_times)]
+    speedups = [torch/tri for torch, tri in zip(torch_times, triton_times)]
     
     # Plot speedups
-    plt.plot(x_vals, vec_speedups, 'bo-', label='vs PyTorch Vectorized', linewidth=2)
-    plt.plot(x_vals, non_vec_speedups, 'gs--', label='vs PyTorch Non-Vectorized', linewidth=2)
+    plt.plot(x_vals, speedups, 'bo-', label='vs PyTorch', linewidth=2)
     
     # Add reference line at y=1
     plt.axhline(y=1.0, color='r', linestyle='-', alpha=0.3, label='Baseline (Equal Performance)')
@@ -537,23 +490,6 @@ def create_matplotlib_plots(data, x_name, timestamp):
     plt.savefig(os.path.join('results', speedup_filename), bbox_inches='tight')
     plt.close()
     print(f"Speedup plot saved to results/{speedup_filename}")
-    
-    # If PyTorch non-vectorized is much slower, create a separate plot without it
-    if max(non_vec_speedups) > 5 * max(vec_speedups):
-        plt.figure(figsize=(10, 6), dpi=150)
-        plt.plot(x_vals, triton_times, 'ro-', label='Triton', linewidth=2)
-        plt.plot(x_vals, torch_vec_times, 'bo-', label='PyTorch Vectorized', linewidth=2)
-        
-        plt.xlabel(x_name, fontsize=12)
-        plt.ylabel('Execution Time (ms)', fontsize=12)
-        plt.title(f'Apple CCE Performance - Vectorized Only (Varying {x_name})', fontsize=14)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=10)
-        
-        vec_only_filename = f"apple_cce_vec_only_{x_name}_{timestamp}.png"
-        plt.savefig(os.path.join('results', vec_only_filename), bbox_inches='tight')
-        plt.close()
-        print(f"Vectorized-only plot saved to results/{vec_only_filename}")
 
 
 if __name__ == "__main__":
