@@ -174,7 +174,19 @@ def benchmark_indexed_essential_probs(shapes: tuple, device=DEVICE):
 ########## ALGORITHM (2) ###########
 # Log-Sum-Exp ( Matrix-Multiplication )
 
-@triton.autotune(configs = autotune_configs_lsemm, key=['N', 'D', 'V'])
+# Define autotuning configurations for lsemm
+autotune_configs_lsemm = [
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_D': 32, 'BLOCK_SIZE_V': 32, 'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_D': 32, 'BLOCK_SIZE_V': 32, 'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_D': 64, 'BLOCK_SIZE_V': 32, 'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_D': 64, 'BLOCK_SIZE_V': 32, 'GROUP_SIZE': 8}, num_warps=8),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_D': 32, 'BLOCK_SIZE_V': 64, 'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_D': 32, 'BLOCK_SIZE_V': 64, 'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_D': 64, 'BLOCK_SIZE_V': 64, 'GROUP_SIZE': 8}, num_warps=8),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_D': 64, 'BLOCK_SIZE_V': 64, 'GROUP_SIZE': 8}, num_warps=8),
+]
+
+@triton.autotune(configs=autotune_configs_lsemm, key=['N', 'D', 'V'])
 @triton.jit
 def _lsemm_kernel(
     e_ptr, c_ptr, output_ptr, locks_ptr,
@@ -243,12 +255,15 @@ def _lsemm_kernel(
         # let's heuristically/randomly assume that for numerical stability and 
         # there will be no problem of gradients, but the LR or something might need to compensate
         # for the irregular order of the graidents.
-
-        guess_factor = 4
-        mx1, mx2 = tl.max(a), tl.max(b)
-        correction_term = mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)
+        # NVM no need to do this, a mistake on my side
+            # guess_factor = 4
+            # mx1, mx2 = tl.max(a), tl.max(b)
+            # correction_term = mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)
                            
-        acc += tl.sum(tl.exp((tl.dot(a, b)) - correction_term), axis=0)
+        matmul_res = tl.dot(a, b)
+        correction_term = tl.max(matmul_res)
+
+        acc += tl.sum(tl.exp(matmul_res - correction_term), axis=0)
 
         correction_term = tl.exp(-correction_term) * num_masked_v
         # Unlawfully adding themselved into the sum of the matrices
@@ -280,71 +295,85 @@ def _lsemm_kernel(
     tl.atomic_xchg(locks_ptr, 0)
 
 
-######### Step 2 #########
-def matmul(a, b):
-    # check constraints
-    assert a.ndim == b.ndim == 2, "only supports matrices, not vectors or tensors"
-    assert a.shape[1] == b.shape[0], "incompatible dimensions"
-    #assert a.is_contiguous() and b.is_contiguous, "input matrices must be contiguous"
-    a, b = a.to(torch.float16), b.to(torch.float16)
+def lsemm(E, C):
+    assert C.ndim == E.ndim == 2, "only supports matrices, not vectors or tensors"
+    assert C.shape[1] == E.shape[0], "incompatible dimensions"
     
-    # get dimesion lengths
-    (M, K), (_, N) = a.shape, b.shape
-    locks = torch.zeros(2 * meta['BLOCK_SIZE_N'], dtype=torch.int32, device=DEVICE)
-
-    # allocates output
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    (D, N), (V, _) = E.shape, C.shape
+    O = torch.empty((N,), device=E.device, dtype=torch.float32)
+    L = N // 32  # We assume the block size is larger than that and we will have enough locks
+    locks = torch.zeros(2 * L, dtype=torch.int32, device=E.device)
     
-    # cdiv(x, y) = (x + (y - 1)) // y
-    # A naive (slow) launch grid might try to separate our axes of parallelizatio into 2 dimensions, one
-    #  for cdiv(M, BLOCK_SIZE_M) and the other for cdiv(N, BLOCK_SIZE_N)
-    # Here instead we use a 1D launch kernel defined by cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
-    # The reasoning behind this is explained inside the kernel
-    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
-    _matmul_kernel[grid](
-        a, b, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
+    grid = lambda meta: (triton.cdiv(V, meta['BLOCK_SIZE_V']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
+    _lsemm_kernel[grid](
+        E, C, O, locks,
+        N, D, V, L,
+        E.stride(0), E.stride(1),
+        C.stride(0), C.stride(1),
+        O.stride(0), locks.stride(0),
     )
-    return c
+    return O
 
-######### Step 1 #########
-def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO does rtol=0 mean we don't use rtol?
+@torch.compile
+def torch_lsemm(E, C):
+    assert C.ndim == E.ndim == 2, "only supports matrices, not vectors or tensors"
+    assert C.shape[1] == E.shape[0], "incompatible dimensions"
+
+    RES = C @ E  # (V, D) @ (D, N) = (V, N)
+    mx = torch.max(RES)
+    RES -= mx
+    RES = torch.sum(torch.exp(RES), axis=0)
+    return torch.log(RES)
+
+def test_lsemm(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
     # create input data
     torch.manual_seed(0)
-    assert type(size) == tuple and len(size) == 2
-    a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    assert type(shapes) == tuple and len(shapes) == 3
+    N, D, V = shapes
+    E = torch.randn([D, N], device=device)
+    C = torch.randn([V, D], device=device)
     # run kernel & pytorch reference implementation
-    c_tri = matmul(a, b)
-    c_ref = torch.matmul(a, b)
+    c_tri = lsemm(E, C)
+    c_ref = torch_lsemm(E, C)
     # compare
     torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
     print("PASSED")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def benchmark_lsemm(shapes: tuple, device=DEVICE):
+    # create input data
+    torch.manual_seed(0)
+    assert type(shapes) == tuple and len(shapes) == 3
+    N, D, V = shapes
+    E = torch.randn([D, N], device=device)
+    C = torch.randn([V, D], device=device)
+    
+    # Ensure all tensors are on the correct device and contiguous
+    E = E.contiguous().to(device)
+    C = C.contiguous().to(device)
+    
+    # Run the benchmark
+    quantiles = [0.5, 0.05, 0.95]
+    tri_ms, tri_min_ms, tri_max_ms = triton.testing.do_bench(
+        lambda: lsemm(E, C), 
+        quantiles=quantiles
+    )
+    
+    torch_ms, torch_min_ms, torch_max_ms = triton.testing.do_bench(
+        lambda: torch_lsemm(E, C), 
+        quantiles=quantiles
+    )
+    
+    print(f"Shape: N={N}, D={D}, V={V}")
+    print(f"Triton: {tri_ms:.3f}ms (min: {tri_min_ms:.3f}ms, max: {tri_max_ms:.3f}ms)")
+    print(f"PyTorch: {torch_ms:.3f}ms (min: {torch_min_ms:.3f}ms, max: {torch_max_ms:.3f}ms)")
+    
+    speedup = torch_ms / tri_ms
+    print(f"Speedup vs PyTorch: {speedup:.2f}x")
+    
+    return {
+        'triton': (tri_ms, tri_min_ms, tri_max_ms),
+        'torch': (torch_ms, torch_min_ms, torch_max_ms)
+    }
 
 
 # Add more comprehensive benchmarking with triton.testing.perf_report
@@ -357,7 +386,7 @@ configs = [
         line_names=["Triton", "PyTorch"],
         styles=[("red", "-"), ("blue", "-")],
         ylabel="Execution Time (ms)",
-        plot_name="apple-cce-performance-N",
+        plot_name="iep-performance-N",
         args={"D": 512, "V": 2048},  # Fixed dimensions
     ),
     triton.testing.Benchmark(
@@ -368,7 +397,7 @@ configs = [
         line_names=["Triton", "PyTorch"],
         styles=[("red", "-"), ("blue", "-")],
         ylabel="Execution Time (ms)",
-        plot_name="apple-cce-performance-D",
+        plot_name="iep-performance-D",
         args={"N": 512, "V": 2048},  # Fixed dimensions
     ),
     triton.testing.Benchmark(
@@ -379,14 +408,51 @@ configs = [
         line_names=["Triton", "PyTorch"],
         styles=[("red", "-"), ("blue", "-")],
         ylabel="Execution Time (ms)",
-        plot_name="apple-cce-performance-V",
+        plot_name="iep-performance-V",
+        args={"N": 512, "D": 512},  # Fixed dimensions
+    ),
+]
+
+# Add configs for lsemm benchmarks
+lsemm_configs = [
+    triton.testing.Benchmark(
+        x_names=["N"],  # We'll vary sequence length
+        x_vals=[128 * i for i in range(1, 17)],  # From 128 to 2048
+        line_arg="provider",
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-")],
+        ylabel="Execution Time (ms)",
+        plot_name="lsemm-performance-N",
+        args={"D": 512, "V": 2048},  # Fixed dimensions
+    ),
+    triton.testing.Benchmark(
+        x_names=["D"],  # We'll vary embedding dimension
+        x_vals=[128 * i for i in range(1, 9)],  # From 128 to 1024
+        line_arg="provider",
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-")],
+        ylabel="Execution Time (ms)",
+        plot_name="lsemm-performance-D",
+        args={"N": 512, "V": 2048},  # Fixed dimensions
+    ),
+    triton.testing.Benchmark(
+        x_names=["V"],  # We'll vary vocabulary size
+        x_vals=[1000 * i for i in range(1, 11)],  # From 1000 to 10000
+        line_arg="provider",
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-")],
+        ylabel="Execution Time (ms)",
+        plot_name="lsemm-performance-V",
         args={"N": 512, "D": 512},  # Fixed dimensions
     ),
 ]
 
 
 @triton.testing.perf_report(configs)
-def benchmark(N, D, V, provider):
+def benchmark_iep(N, D, V, provider):
     # Create input tensors
     torch.manual_seed(0)
     E = torch.randn([D, N], device=DEVICE).contiguous()
@@ -403,6 +469,31 @@ def benchmark(N, D, V, provider):
     elif provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: torch_indexed_essential_probs(E, C, I), 
+            quantiles=quantiles
+        )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+    
+    return ms, max_ms, min_ms
+
+
+@triton.testing.perf_report(lsemm_configs)
+def benchmark_lsemm_perf(N, D, V, provider):
+    # Create input tensors
+    torch.manual_seed(0)
+    E = torch.randn([D, N], device=DEVICE).contiguous()
+    C = torch.randn([V, D], device=DEVICE).contiguous()
+    
+    quantiles = [0.5, 0.05, 0.95]
+    
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: lsemm(E, C), 
+            quantiles=quantiles
+        )
+    elif provider == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: torch_lsemm(E, C), 
             quantiles=quantiles
         )
     else:
@@ -475,8 +566,16 @@ def run_basic_benchmarks():
         (256, 1024, 1024), # High dimension
     ]
     
-    # Prepare results dictionary
-    results = {
+    # Prepare results dictionary for IEP
+    iep_results = {
+        'Shape': [],
+        'N': [], 'D': [], 'V': [],
+        'Triton (ms)': [], 'PyTorch (ms)': [],
+        'Speedup': []
+    }
+    
+    # Prepare results dictionary for lsemm
+    lsemm_results = {
         'Shape': [],
         'N': [], 'D': [], 'V': [],
         'Triton (ms)': [], 'PyTorch (ms)': [],
@@ -486,7 +585,9 @@ def run_basic_benchmarks():
     for shape in shapes:
         N, D, V = shape
         shape_str = f"N={N}, D={D}, V={V}"
-        print(f"\nBenchmarking shape: {shape_str}")
+        
+        # Benchmark indexed_essential_probs
+        print(f"\nBenchmarking indexed_essential_probs with shape: {shape_str}")
         timings = benchmark_indexed_essential_probs(shape)
         
         # Extract timing values
@@ -497,30 +598,68 @@ def run_basic_benchmarks():
         speedup = torch_ms / tri_ms
         
         # Store results
-        results['Shape'].append(shape_str)
-        results['N'].append(N)
-        results['D'].append(D)
-        results['V'].append(V)
-        results['Triton (ms)'].append(f"{tri_ms:.2f}")
-        results['PyTorch (ms)'].append(f"{torch_ms:.2f}")
-        results['Speedup'].append(f"{speedup:.2f}x")
+        iep_results['Shape'].append(shape_str)
+        iep_results['N'].append(N)
+        iep_results['D'].append(D)
+        iep_results['V'].append(V)
+        iep_results['Triton (ms)'].append(f"{tri_ms:.2f}")
+        iep_results['PyTorch (ms)'].append(f"{torch_ms:.2f}")
+        iep_results['Speedup'].append(f"{speedup:.2f}x")
+        
+        # Benchmark lsemm
+        print(f"\nBenchmarking lsemm with shape: {shape_str}")
+        lsemm_timings = benchmark_lsemm(shape)
+        
+        # Extract timing values
+        lsemm_tri_ms = lsemm_timings['triton'][0]
+        lsemm_torch_ms = lsemm_timings['torch'][0]
+        
+        # Calculate speedup
+        lsemm_speedup = lsemm_torch_ms / lsemm_tri_ms
+        
+        # Store results
+        lsemm_results['Shape'].append(shape_str)
+        lsemm_results['N'].append(N)
+        lsemm_results['D'].append(D)
+        lsemm_results['V'].append(V)
+        lsemm_results['Triton (ms)'].append(f"{lsemm_tri_ms:.2f}")
+        lsemm_results['PyTorch (ms)'].append(f"{lsemm_torch_ms:.2f}")
+        lsemm_results['Speedup'].append(f"{lsemm_speedup:.2f}x")
     
     # Export results to CSV
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"apple_cce_basic_benchmarks_{timestamp}.csv"
-    df = export_results_to_csv(results, csv_filename)
+    
+    # Export indexed_essential_probs results
+    iep_csv_filename = f"iep_basic_benchmarks_{timestamp}.csv"
+    iep_df = export_results_to_csv(iep_results, iep_csv_filename)
     
     # Create summary table as PNG
-    png_filename = f"apple_cce_basic_benchmarks_{timestamp}.png"
-    create_summary_table(df, "Apple CCE Basic Benchmarks", png_filename)
+    iep_png_filename = f"iep_basic_benchmarks_{timestamp}.png"
+    create_summary_table(iep_df, "IEP Basic Benchmarks", iep_png_filename)
+    
+    # Export lsemm results
+    lsemm_csv_filename = f"lsemm_basic_benchmarks_{timestamp}.csv"
+    lsemm_df = export_results_to_csv(lsemm_results, lsemm_csv_filename)
+    
+    # Create summary table as PNG for lsemm
+    lsemm_png_filename = f"lsemm_basic_benchmarks_{timestamp}.png"
+    create_summary_table(lsemm_df, "LSEMM Basic Benchmarks", lsemm_png_filename)
     
     # Print summary
     print("\n----- BENCHMARK SUMMARY -----")
+    print("\nIndexed Essential Probs (IEP):")
     for i, shape in enumerate(shapes):
         N, D, V = shape
-        print(f"Shape ({results['Shape'][i]}):")
-        print(f"  Triton: {results['Triton (ms)'][i]}ms")
-        print(f"  PyTorch: {results['PyTorch (ms)'][i]}ms (speedup: {results['Speedup'][i]})")
+        print(f"Shape ({iep_results['Shape'][i]}):")
+        print(f"  Triton: {iep_results['Triton (ms)'][i]}ms")
+        print(f"  PyTorch: {iep_results['PyTorch (ms)'][i]}ms (speedup: {iep_results['Speedup'][i]})")
+    
+    print("\nLSEMM:")
+    for i, shape in enumerate(shapes):
+        N, D, V = shape
+        print(f"Shape ({lsemm_results['Shape'][i]}):")
+        print(f"  Triton: {lsemm_results['Triton (ms)'][i]}ms")
+        print(f"  PyTorch: {lsemm_results['PyTorch (ms)'][i]}ms (speedup: {lsemm_results['Speedup'][i]})")
 
 
 def run_detailed_benchmarks(show_plots=False):
@@ -533,12 +672,15 @@ def run_detailed_benchmarks(show_plots=False):
     # Rather than relying on benchmark.run() which isn't returning data properly
     results = {}
     
-    for config in configs:
+    # Combine both config sets
+    all_configs = configs + lsemm_configs
+    
+    for config in all_configs:
         config_name = config.plot_name
         x_name = config_name.split('-')[-1]
         x_vals = config.x_vals
         
-        print(f"\nBenchmarking with varying {x_name}...")
+        print(f"\nBenchmarking with varying {x_name} for {config_name}...")
         
         # Initialize data containers
         data = {
@@ -570,22 +712,37 @@ def run_detailed_benchmarks(show_plots=False):
             torch.manual_seed(0)
             E = torch.randn([params['D'], params['N']], device=DEVICE).contiguous()
             C = torch.randn([params['V'], params['D']], device=DEVICE).contiguous()
-            I = torch.randint(high=params['V'], size=(params['N'],), device=DEVICE).contiguous()
             
             # Benchmark each provider
             quantiles = [0.5, 0.05, 0.95]
             
-            # Triton implementation
-            tri_ms, tri_min_ms, tri_max_ms = triton.testing.do_bench(
-                lambda: indexed_essential_probs(E, C, I), 
-                quantiles=quantiles
-            )
-            
-            # PyTorch
-            torch_ms, torch_min_ms, torch_max_ms = triton.testing.do_bench(
-                lambda: torch_indexed_essential_probs(E, C, I), 
-                quantiles=quantiles
-            )
+            if 'lsemm' in config_name:
+                # LSEMM implementation
+                tri_ms, tri_min_ms, tri_max_ms = triton.testing.do_bench(
+                    lambda: lsemm(E, C), 
+                    quantiles=quantiles
+                )
+                
+                # PyTorch LSEMM
+                torch_ms, torch_min_ms, torch_max_ms = triton.testing.do_bench(
+                    lambda: torch_lsemm(E, C), 
+                    quantiles=quantiles
+                )
+            else:
+                # For indexed_essential_probs (iep)
+                I = torch.randint(high=params['V'], size=(params['N'],), device=DEVICE).contiguous()
+                
+                # Triton implementation
+                tri_ms, tri_min_ms, tri_max_ms = triton.testing.do_bench(
+                    lambda: indexed_essential_probs(E, C, I), 
+                    quantiles=quantiles
+                )
+                
+                # PyTorch
+                torch_ms, torch_min_ms, torch_max_ms = triton.testing.do_bench(
+                    lambda: torch_indexed_essential_probs(E, C, I), 
+                    quantiles=quantiles
+                )
             
             # Store results
             data['triton'].append((x_val, tri_ms))
@@ -601,22 +758,22 @@ def run_detailed_benchmarks(show_plots=False):
         results[config_name] = data
         
         # Export to CSV
-        csv_filename = f"apple_cce_detailed_{x_name}_{timestamp}.csv"
+        csv_filename = f"{config_name}_{x_name}_{timestamp}.csv"
         df = pd.DataFrame(csv_data)
         df.to_csv(os.path.join('results', csv_filename), index=False)
-        print(f"Detailed results for {x_name} saved to results/{csv_filename}")
+        print(f"Detailed results for {config_name} ({x_name}) saved to results/{csv_filename}")
         
         # Create summary table
-        png_filename = f"apple_cce_detailed_{x_name}_{timestamp}.png"
-        create_summary_table(df, f"Apple CCE Performance (Varying {x_name})", png_filename)
+        png_filename = f"{config_name}_{x_name}_{timestamp}.png"
+        create_summary_table(df, f"{config_name.replace('-', ' ').title()} (Varying {x_name})", png_filename)
         
         # Create plots
-        create_matplotlib_plots(data, x_name, timestamp)
+        create_matplotlib_plots(data, x_name, config_name, timestamp)
     
     return results
 
 
-def create_matplotlib_plots(data, x_name, timestamp):
+def create_matplotlib_plots(data, x_name, config_name, timestamp):
     """Create performance and speedup plots using matplotlib"""
     # Extract data
     x_vals = [point[0] for point in data['triton']]
@@ -631,7 +788,7 @@ def create_matplotlib_plots(data, x_name, timestamp):
     # Add labels and title
     plt.xlabel(x_name, fontsize=12)
     plt.ylabel('Execution Time (ms)', fontsize=12)
-    plt.title(f'Apple CCE Performance (Varying {x_name})', fontsize=14)
+    plt.title(f'{config_name.replace("-", " ").title()} (Varying {x_name})', fontsize=14)
     
     # Add grid and legend
     plt.grid(True, linestyle='--', alpha=0.7)
@@ -639,7 +796,7 @@ def create_matplotlib_plots(data, x_name, timestamp):
     
     # Save plot
     os.makedirs('results', exist_ok=True)
-    performance_filename = f"apple_cce_performance_{x_name}_{timestamp}.png"
+    performance_filename = f"{config_name}_performance_{x_name}_{timestamp}.png"
     plt.savefig(os.path.join('results', performance_filename), bbox_inches='tight')
     plt.close()
     print(f"Performance plot saved to results/{performance_filename}")
@@ -659,14 +816,14 @@ def create_matplotlib_plots(data, x_name, timestamp):
     # Add labels and title
     plt.xlabel(x_name, fontsize=12)
     plt.ylabel('Speedup (x times)', fontsize=12)
-    plt.title(f'Triton Speedup (Varying {x_name})', fontsize=14)
+    plt.title(f'{config_name.replace("-", " ").title()} Speedup (Varying {x_name})', fontsize=14)
     
     # Add grid and legend
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=10)
     
     # Save speedup plot
-    speedup_filename = f"apple_cce_speedup_{x_name}_{timestamp}.png"
+    speedup_filename = f"{config_name}_speedup_{x_name}_{timestamp}.png"
     plt.savefig(os.path.join('results', speedup_filename), bbox_inches='tight')
     plt.close()
     print(f"Speedup plot saved to results/{speedup_filename}")
@@ -678,11 +835,15 @@ if __name__ == "__main__":
     parser.add_argument('--basic-benchmarks', action='store_true', help='Run basic benchmarks')
     parser.add_argument('--detailed-benchmarks', action='store_true', help='Run detailed benchmarks with plots')
     parser.add_argument('--all', action='store_true', help='Run all tests and benchmarks')
+    parser.add_argument('--test-lsemm', action='store_true', help='Run only the LSEMM correctness test')
+    parser.add_argument('--test-iep', action='store_true', help='Run only the IEP correctness test')
     
     args = parser.parse_args()
     
     # Default to running all if no arguments are provided
-    run_all = args.all or (not args.test_only and not args.basic_benchmarks and not args.detailed_benchmarks)
+    run_all = args.all or (not args.test_only and not args.basic_benchmarks and 
+                          not args.detailed_benchmarks and not args.test_lsemm and 
+                          not args.test_iep)
     
     if torch.cuda.is_available():
         print("CUDA is available, running on GPU")
@@ -690,10 +851,16 @@ if __name__ == "__main__":
         print("CUDA is not available, running on CPU")
     
     try:
-        # Always run the correctness test first
-        print("Running correctness test...")
-        test_indexed_essential_probs(shapes=(128, 128, 128))
-        print("Test passed!")
+        # Run correctness tests
+        if args.test_iep or args.test_only or run_all:
+            print("Running indexed_essential_probs correctness test...")
+            test_indexed_essential_probs(shapes=(117, 599, 201))
+            print("IEP test passed!")
+        
+        if args.test_lsemm or run_all:
+            print("Running LSEMM correctness test...")
+            test_lsemm(shapes=(555, 333, 600))
+            print("LSEMM test passed!")
         
         if args.basic_benchmarks or run_all:
             print("\nRunning basic benchmarks...")
