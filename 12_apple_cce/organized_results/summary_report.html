@@ -1,0 +1,496 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Apple CCE Benchmark Summary</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            h1 { color: #333; }
+            h2 { color: #555; margin-top: 30px; }
+            h3 { color: #666; margin-top: 20px; }
+            table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+            tr:nth-child(even) { background-color: #f9f9f9; }
+            .summary { margin-top: 30px; padding: 15px; background-color: #f5f5f5; border-radius: 5px; }
+            .plot-description { margin-bottom: 15px; padding: 10px; background-color: #f9f9f9; border-left: 4px solid #4CAF50; }
+            .plot-container { margin: 20px 0; text-align: center; }
+            .plot-container img { max-width: 100%; height: auto; border: 1px solid #ddd; }
+        </style>
+    </head>
+    <body>
+        <h1>Apple CCE Benchmark Summary</h1>
+        <p>Generated on: 2025-03-24 10:55:24</p>
+        <div class="summary">
+            <h2>Overview</h2>
+            <p>This report summarizes the benchmark results for the Apple CCE implementation.</p>
+            <p>The benchmarks compare two implementations:</p>
+            <ul>
+                <li><strong>Triton</strong>: Our optimized implementation using the Triton framework</li>
+                <li><strong>PyTorch</strong>: A vectorized implementation using PyTorch operations</li>
+            </ul>
+        </div>
+    <h2>Results from apple_cce_basic_benchmarks_20250324_104802.csv</h2>
+                <div class="plot-description">
+                    <h3>Basic Benchmarks Table</h3>
+                    <p>This table shows performance comparisons across different shape configurations where all dimensions (N, D, V) are scaled together.</p>
+                    <ul>
+                        <li><strong>Shape</strong>: The dimensions used for the benchmark (N=batch size, D=embedding dimension, V=vocabulary size)</li>
+                        <li><strong>Triton (ms)</strong>: Execution time for the Triton implementation in milliseconds</li>
+                        <li><strong>PyTorch (ms)</strong>: Execution time for the PyTorch implementation in milliseconds</li>
+                        <li><strong>Speedup</strong>: How many times faster Triton is compared to PyTorch</li>
+                    </ul>
+                </div>
+                <table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>Shape</th>
+      <th>N</th>
+      <th>D</th>
+      <th>V</th>
+      <th>Triton (ms)</th>
+      <th>PyTorch (ms)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>N=128, D=128, V=128</td>
+      <td>128</td>
+      <td>128</td>
+      <td>128</td>
+      <td>0.01</td>
+      <td>0.02</td>
+      <td>2.12x</td>
+    </tr>
+    <tr>
+      <td>N=256, D=256, V=256</td>
+      <td>256</td>
+      <td>256</td>
+      <td>256</td>
+      <td>0.01</td>
+      <td>0.02</td>
+      <td>1.95x</td>
+    </tr>
+    <tr>
+      <td>N=512, D=512, V=512</td>
+      <td>512</td>
+      <td>512</td>
+      <td>512</td>
+      <td>0.02</td>
+      <td>0.04</td>
+      <td>2.67x</td>
+    </tr>
+    <tr>
+      <td>N=1024, D=256, V=1024</td>
+      <td>1024</td>
+      <td>256</td>
+      <td>1024</td>
+      <td>0.01</td>
+      <td>0.04</td>
+      <td>3.67x</td>
+    </tr>
+    <tr>
+      <td>N=256, D=1024, V=1024</td>
+      <td>256</td>
+      <td>1024</td>
+      <td>1024</td>
+      <td>0.02</td>
+      <td>0.04</td>
+      <td>1.62x</td>
+    </tr>
+  </tbody>
+</table>
+                <div class="summary">
+                    <p><strong>Average Speedup vs PyTorch:</strong> nanx</p>
+                    <p><strong>Maximum Speedup vs PyTorch:</strong> nanx</p>
+                </div>
+                <h2>Results from detailed_N_20250324/apple_cce_detailed_N_20250324_104803.csv</h2>
+                    <div class="plot-description">
+                        <h3>Detailed Benchmark Table (Varying N_20250324_104803)</h3>
+                        <p>This table shows performance metrics when varying the N_20250324_104803 while keeping other dimensions fixed.</p>
+                        <p>The x-axis represents different values of N_20250324_104803, and the y-axis (in the corresponding plots) shows execution time in milliseconds.</p>
+                        <p>Each implementation (Triton, PyTorch) is represented as a different data series.</p>
+                        <ul>
+                            <li><strong>N_20250324_104803</strong>: The varying N_20250324_104803 value</li>
+                            <li><strong>Triton (ms)</strong>: Execution time for the Triton implementation in milliseconds</li>
+                            <li><strong>PyTorch (ms)</strong>: Execution time for the PyTorch implementation in milliseconds</li>
+                            <li><strong>Speedup</strong>: How many times faster Triton is compared to PyTorch</li>
+                        </ul>
+                    </div>
+                    <table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>N</th>
+      <th>Triton (ms)</th>
+      <th>PyTorch (ms)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>128</td>
+      <td>14.24</td>
+      <td>21.54</td>
+      <td>1.51x</td>
+    </tr>
+    <tr>
+      <td>256</td>
+      <td>14.85</td>
+      <td>26.69</td>
+      <td>1.80x</td>
+    </tr>
+    <tr>
+      <td>384</td>
+      <td>15.07</td>
+      <td>32.48</td>
+      <td>2.15x</td>
+    </tr>
+    <tr>
+      <td>512</td>
+      <td>15.07</td>
+      <td>42.18</td>
+      <td>2.80x</td>
+    </tr>
+    <tr>
+      <td>640</td>
+      <td>15.55</td>
+      <td>48.93</td>
+      <td>3.15x</td>
+    </tr>
+    <tr>
+      <td>768</td>
+      <td>16.13</td>
+      <td>55.81</td>
+      <td>3.46x</td>
+    </tr>
+    <tr>
+      <td>896</td>
+      <td>17.02</td>
+      <td>65.82</td>
+      <td>3.87x</td>
+    </tr>
+    <tr>
+      <td>1024</td>
+      <td>17.76</td>
+      <td>75.34</td>
+      <td>4.24x</td>
+    </tr>
+    <tr>
+      <td>1152</td>
+      <td>18.66</td>
+      <td>88.64</td>
+      <td>4.75x</td>
+    </tr>
+    <tr>
+      <td>1280</td>
+      <td>19.65</td>
+      <td>95.20</td>
+      <td>4.85x</td>
+    </tr>
+    <tr>
+      <td>1408</td>
+      <td>20.99</td>
+      <td>105.01</td>
+      <td>5.00x</td>
+    </tr>
+    <tr>
+      <td>1536</td>
+      <td>21.18</td>
+      <td>112.80</td>
+      <td>5.32x</td>
+    </tr>
+    <tr>
+      <td>1664</td>
+      <td>21.95</td>
+      <td>118.34</td>
+      <td>5.39x</td>
+    </tr>
+    <tr>
+      <td>1792</td>
+      <td>22.69</td>
+      <td>131.70</td>
+      <td>5.80x</td>
+    </tr>
+    <tr>
+      <td>1920</td>
+      <td>24.00</td>
+      <td>140.51</td>
+      <td>5.85x</td>
+    </tr>
+    <tr>
+      <td>2048</td>
+      <td>24.48</td>
+      <td>142.45</td>
+      <td>5.82x</td>
+    </tr>
+  </tbody>
+</table>
+                <div class="summary">
+                    <p><strong>Average Speedup vs PyTorch:</strong> nanx</p>
+                    <p><strong>Maximum Speedup vs PyTorch:</strong> nanx</p>
+                </div>
+                
+                        <h3>Associated Plots</h3>
+                        <div class="plot-description">
+                            <h4>Performance Plot</h4>
+                            <p>The performance plot shows execution time (ms) on the y-axis versus N_20250324 values on the x-axis.</p>
+                            <p>Lower values indicate better performance. The plot includes two lines:</p>
+                            <ul>
+                                <li><strong>Triton</strong>: Our optimized Triton implementation</li>
+                                <li><strong>PyTorch</strong>: The PyTorch implementation</li>
+                            </ul>
+                        </div>
+                        
+                            <div class="plot-container">
+                                <img src="plots/performance/apple_cce_performance_N_20250324_104803.png" alt="Performance plot for N_20250324">
+                            </div>
+                            
+                        <div class="plot-description">
+                            <h4>Speedup Plot</h4>
+                            <p>The speedup plot shows the relative performance gain of Triton compared to PyTorch implementation.</p>
+                            <p>The y-axis shows speedup factor (higher is better), and the x-axis shows N_20250324 values.</p>
+                            <ul>
+                                <li><strong>Speedup vs PyTorch</strong>: How many times faster Triton is compared to PyTorch</li>
+                                <li><strong>Baseline (Equal Performance)</strong>: Reference line at y=1.0</li>
+                            </ul>
+                        </div>
+                        
+                            <div class="plot-container">
+                                <img src="plots/speedup/apple_cce_speedup_N_20250324_104803.png" alt="Speedup plot for N_20250324">
+                            </div>
+                            <h2>Results from detailed_D_20250324/apple_cce_detailed_D_20250324_104803.csv</h2>
+                    <div class="plot-description">
+                        <h3>Detailed Benchmark Table (Varying D_20250324_104803)</h3>
+                        <p>This table shows performance metrics when varying the D_20250324_104803 while keeping other dimensions fixed.</p>
+                        <p>The x-axis represents different values of D_20250324_104803, and the y-axis (in the corresponding plots) shows execution time in milliseconds.</p>
+                        <p>Each implementation (Triton, PyTorch) is represented as a different data series.</p>
+                        <ul>
+                            <li><strong>D_20250324_104803</strong>: The varying D_20250324_104803 value</li>
+                            <li><strong>Triton (ms)</strong>: Execution time for the Triton implementation in milliseconds</li>
+                            <li><strong>PyTorch (ms)</strong>: Execution time for the PyTorch implementation in milliseconds</li>
+                            <li><strong>Speedup</strong>: How many times faster Triton is compared to PyTorch</li>
+                        </ul>
+                    </div>
+                    <table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>D</th>
+      <th>Triton (ms)</th>
+      <th>PyTorch (ms)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>128</td>
+      <td>7.68</td>
+      <td>21.41</td>
+      <td>2.79x</td>
+    </tr>
+    <tr>
+      <td>256</td>
+      <td>10.30</td>
+      <td>28.93</td>
+      <td>2.81x</td>
+    </tr>
+    <tr>
+      <td>384</td>
+      <td>12.83</td>
+      <td>32.96</td>
+      <td>2.57x</td>
+    </tr>
+    <tr>
+      <td>512</td>
+      <td>15.10</td>
+      <td>42.30</td>
+      <td>2.80x</td>
+    </tr>
+    <tr>
+      <td>640</td>
+      <td>17.57</td>
+      <td>49.34</td>
+      <td>2.81x</td>
+    </tr>
+    <tr>
+      <td>768</td>
+      <td>20.26</td>
+      <td>57.50</td>
+      <td>2.84x</td>
+    </tr>
+    <tr>
+      <td>896</td>
+      <td>23.26</td>
+      <td>65.82</td>
+      <td>2.83x</td>
+    </tr>
+    <tr>
+      <td>1024</td>
+      <td>26.02</td>
+      <td>76.06</td>
+      <td>2.92x</td>
+    </tr>
+  </tbody>
+</table>
+                <div class="summary">
+                    <p><strong>Average Speedup vs PyTorch:</strong> nanx</p>
+                    <p><strong>Maximum Speedup vs PyTorch:</strong> nanx</p>
+                </div>
+                
+                        <h3>Associated Plots</h3>
+                        <div class="plot-description">
+                            <h4>Performance Plot</h4>
+                            <p>The performance plot shows execution time (ms) on the y-axis versus D_20250324 values on the x-axis.</p>
+                            <p>Lower values indicate better performance. The plot includes two lines:</p>
+                            <ul>
+                                <li><strong>Triton</strong>: Our optimized Triton implementation</li>
+                                <li><strong>PyTorch</strong>: The PyTorch implementation</li>
+                            </ul>
+                        </div>
+                        
+                            <div class="plot-container">
+                                <img src="plots/performance/apple_cce_performance_D_20250324_104803.png" alt="Performance plot for D_20250324">
+                            </div>
+                            
+                        <div class="plot-description">
+                            <h4>Speedup Plot</h4>
+                            <p>The speedup plot shows the relative performance gain of Triton compared to PyTorch implementation.</p>
+                            <p>The y-axis shows speedup factor (higher is better), and the x-axis shows D_20250324 values.</p>
+                            <ul>
+                                <li><strong>Speedup vs PyTorch</strong>: How many times faster Triton is compared to PyTorch</li>
+                                <li><strong>Baseline (Equal Performance)</strong>: Reference line at y=1.0</li>
+                            </ul>
+                        </div>
+                        
+                            <div class="plot-container">
+                                <img src="plots/speedup/apple_cce_speedup_D_20250324_104803.png" alt="Speedup plot for D_20250324">
+                            </div>
+                            <h2>Results from detailed_V_20250324/apple_cce_detailed_V_20250324_104803.csv</h2>
+                    <div class="plot-description">
+                        <h3>Detailed Benchmark Table (Varying V_20250324_104803)</h3>
+                        <p>This table shows performance metrics when varying the V_20250324_104803 while keeping other dimensions fixed.</p>
+                        <p>The x-axis represents different values of V_20250324_104803, and the y-axis (in the corresponding plots) shows execution time in milliseconds.</p>
+                        <p>Each implementation (Triton, PyTorch) is represented as a different data series.</p>
+                        <ul>
+                            <li><strong>V_20250324_104803</strong>: The varying V_20250324_104803 value</li>
+                            <li><strong>Triton (ms)</strong>: Execution time for the Triton implementation in milliseconds</li>
+                            <li><strong>PyTorch (ms)</strong>: Execution time for the PyTorch implementation in milliseconds</li>
+                            <li><strong>Speedup</strong>: How many times faster Triton is compared to PyTorch</li>
+                        </ul>
+                    </div>
+                    <table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>V</th>
+      <th>Triton (ms)</th>
+      <th>PyTorch (ms)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1000</td>
+      <td>15.36</td>
+      <td>42.02</td>
+      <td>2.74x</td>
+    </tr>
+    <tr>
+      <td>2000</td>
+      <td>15.10</td>
+      <td>42.14</td>
+      <td>2.79x</td>
+    </tr>
+    <tr>
+      <td>3000</td>
+      <td>14.98</td>
+      <td>42.08</td>
+      <td>2.81x</td>
+    </tr>
+    <tr>
+      <td>4000</td>
+      <td>14.88</td>
+      <td>42.27</td>
+      <td>2.84x</td>
+    </tr>
+    <tr>
+      <td>5000</td>
+      <td>14.98</td>
+      <td>42.27</td>
+      <td>2.82x</td>
+    </tr>
+    <tr>
+      <td>6000</td>
+      <td>14.91</td>
+      <td>42.27</td>
+      <td>2.83x</td>
+    </tr>
+    <tr>
+      <td>7000</td>
+      <td>14.82</td>
+      <td>42.30</td>
+      <td>2.86x</td>
+    </tr>
+    <tr>
+      <td>8000</td>
+      <td>14.78</td>
+      <td>42.34</td>
+      <td>2.86x</td>
+    </tr>
+    <tr>
+      <td>9000</td>
+      <td>14.75</td>
+      <td>42.34</td>
+      <td>2.87x</td>
+    </tr>
+    <tr>
+      <td>10000</td>
+      <td>14.85</td>
+      <td>42.27</td>
+      <td>2.85x</td>
+    </tr>
+  </tbody>
+</table>
+                <div class="summary">
+                    <p><strong>Average Speedup vs PyTorch:</strong> nanx</p>
+                    <p><strong>Maximum Speedup vs PyTorch:</strong> nanx</p>
+                </div>
+                
+                        <h3>Associated Plots</h3>
+                        <div class="plot-description">
+                            <h4>Performance Plot</h4>
+                            <p>The performance plot shows execution time (ms) on the y-axis versus V_20250324 values on the x-axis.</p>
+                            <p>Lower values indicate better performance. The plot includes two lines:</p>
+                            <ul>
+                                <li><strong>Triton</strong>: Our optimized Triton implementation</li>
+                                <li><strong>PyTorch</strong>: The PyTorch implementation</li>
+                            </ul>
+                        </div>
+                        
+                            <div class="plot-container">
+                                <img src="plots/performance/apple_cce_performance_V_20250324_104803.png" alt="Performance plot for V_20250324">
+                            </div>
+                            
+                        <div class="plot-description">
+                            <h4>Speedup Plot</h4>
+                            <p>The speedup plot shows the relative performance gain of Triton compared to PyTorch implementation.</p>
+                            <p>The y-axis shows speedup factor (higher is better), and the x-axis shows V_20250324 values.</p>
+                            <ul>
+                                <li><strong>Speedup vs PyTorch</strong>: How many times faster Triton is compared to PyTorch</li>
+                                <li><strong>Baseline (Equal Performance)</strong>: Reference line at y=1.0</li>
+                            </ul>
+                        </div>
+                        
+                            <div class="plot-container">
+                                <img src="plots/speedup/apple_cce_speedup_V_20250324_104803.png" alt="Speedup plot for V_20250324">
+                            </div>
+                            
+    <h2>Combined Performance Plots</h2>
+    <div class="plot-description">
+        <p>Combined plots aggregate results from multiple benchmark runs to show performance consistency and trends.</p>
+        <p>Each line represents a different benchmark run, with the x-axis showing the varying parameter and the y-axis showing execution time in milliseconds.</p>
+        <p>Different colors and markers are used to distinguish between runs.</p>
+    </div>
+    <p>No combined plots found.</p>
+    </body>
+    </html>
+    

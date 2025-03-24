@@ -107,7 +107,7 @@ def indexed_essential_probs(E, C, I):
         
     return O
 
-
+@torch.compile
 def torch_indexed_essential_probs(E, C, I):
     # Vectorized approach: batch matrix-vector multiplication
     return torch.einsum('ij,ij->i', C[I], E.T)

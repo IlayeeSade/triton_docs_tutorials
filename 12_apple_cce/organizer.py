@@ -64,13 +64,6 @@ def organize_results(source_dir='results', output_dir='organized_results'):
             plot_type_dir = os.path.join(plot_dir, 'speedup')
             os.makedirs(plot_type_dir, exist_ok=True)
             shutil.copy(png_file, os.path.join(plot_type_dir, filename))
-        elif 'vec_only' in filename:
-            plot_type_dir = os.path.join(plot_dir, 'vectorized_only')
-            os.makedirs(plot_type_dir, exist_ok=True)
-            shutil.copy(png_file, os.path.join(plot_type_dir, filename))
-        elif 'detailed' in filename and not ('performance' in filename or 'speedup' in filename):
-            # This is likely a summary table
-            shutil.copy(png_file, os.path.join(table_dir, filename))
         else:
             # Other PNG files
             shutil.copy(png_file, os.path.join(plot_dir, filename))
@@ -118,7 +111,7 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
             <p>The benchmarks compare two implementations:</p>
             <ul>
                 <li><strong>Triton</strong>: Our optimized implementation using the Triton framework</li>
-                <li><strong>PyTorch Vectorized</strong>: A vectorized implementation using PyTorch operations</li>
+                <li><strong>PyTorch</strong>: A vectorized implementation using PyTorch operations</li>
             </ul>
         </div>
     """
@@ -141,8 +134,8 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
                     <ul>
                         <li><strong>Shape</strong>: The dimensions used for the benchmark (N=batch size, D=embedding dimension, V=vocabulary size)</li>
                         <li><strong>Triton (ms)</strong>: Execution time for the Triton implementation in milliseconds</li>
-                        <li><strong>PyTorch Vec (ms)</strong>: Execution time for the vectorized PyTorch implementation in milliseconds</li>
-                        <li><strong>Speedup vs Vec</strong>: How many times faster Triton is compared to vectorized PyTorch</li>
+                        <li><strong>PyTorch (ms)</strong>: Execution time for the PyTorch implementation in milliseconds</li>
+                        <li><strong>Speedup</strong>: How many times faster Triton is compared to PyTorch</li>
                     </ul>
                 </div>
                 """
@@ -162,12 +155,12 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
                         <h3>Detailed Benchmark Table (Varying {param})</h3>
                         <p>This table shows performance metrics when varying the {param_description} while keeping other dimensions fixed.</p>
                         <p>The x-axis represents different values of {param}, and the y-axis (in the corresponding plots) shows execution time in milliseconds.</p>
-                        <p>Each implementation (Triton, PyTorch Vectorized) is represented as a different data series.</p>
+                        <p>Each implementation (Triton, PyTorch) is represented as a different data series.</p>
                         <ul>
                             <li><strong>{param}</strong>: The varying {param_description} value</li>
                             <li><strong>Triton (ms)</strong>: Execution time for the Triton implementation in milliseconds</li>
-                            <li><strong>PyTorch Vec (ms)</strong>: Execution time for the vectorized PyTorch implementation in milliseconds</li>
-                            <li><strong>Speedup vs Vec</strong>: How many times faster Triton is compared to vectorized PyTorch</li>
+                            <li><strong>PyTorch (ms)</strong>: Execution time for the PyTorch implementation in milliseconds</li>
+                            <li><strong>Speedup</strong>: How many times faster Triton is compared to PyTorch</li>
                         </ul>
                     </div>
                     """
@@ -176,16 +169,16 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
             html_content += df.to_html(index=False)
             
             # Add summary statistics if available
-            if 'Speedup vs Vec' in df.columns:
+            if 'Speedup' in df.columns:
                 # Convert to numeric, handling potential string formatting
-                speedup_col = pd.to_numeric(df['Speedup vs Vec'].str.replace('x', ''), errors='coerce')
+                speedup_col = pd.to_numeric(df['Speedup'], errors='coerce')
                 avg_speedup = speedup_col.mean()
                 max_speedup = speedup_col.max()
                 
                 html_content += f"""
                 <div class="summary">
-                    <p><strong>Average Speedup vs Vectorized PyTorch:</strong> {avg_speedup:.2f}x</p>
-                    <p><strong>Maximum Speedup vs Vectorized PyTorch:</strong> {max_speedup:.2f}x</p>
+                    <p><strong>Average Speedup vs PyTorch:</strong> {avg_speedup:.2f}x</p>
+                    <p><strong>Maximum Speedup vs PyTorch:</strong> {max_speedup:.2f}x</p>
                 </div>
                 """
                 
@@ -199,7 +192,6 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
                         # Find corresponding plot files
                         performance_plot = glob.glob(os.path.join(plot_dir, 'performance', f'*performance_{param}_{timestamp}.png'))
                         speedup_plot = glob.glob(os.path.join(plot_dir, 'speedup', f'*speedup_{param}_{timestamp}.png'))
-                        vec_only_plot = glob.glob(os.path.join(plot_dir, 'vectorized_only', f'*vec_only_{param}_{timestamp}.png'))
                         
                         html_content += f"""
                         <h3>Associated Plots</h3>
@@ -208,8 +200,8 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
                             <p>The performance plot shows execution time (ms) on the y-axis versus {param} values on the x-axis.</p>
                             <p>Lower values indicate better performance. The plot includes two lines:</p>
                             <ul>
-                                <li><strong>Red line with circles (Triton)</strong>: Our optimized Triton implementation</li>
-                                <li><strong>Blue line with circles (PyTorch Vectorized)</strong>: The vectorized PyTorch implementation</li>
+                                <li><strong>Triton</strong>: Our optimized Triton implementation</li>
+                                <li><strong>PyTorch</strong>: The PyTorch implementation</li>
                             </ul>
                         </div>
                         """
@@ -229,8 +221,8 @@ def generate_summary_report(csv_dir, output_dir, plot_dir):
                             <p>The speedup plot shows the relative performance gain of Triton compared to PyTorch implementation.</p>
                             <p>The y-axis shows speedup factor (higher is better), and the x-axis shows {param} values.</p>
                             <ul>
-                                <li><strong>Blue line with circles</strong>: Speedup of Triton vs PyTorch Vectorized</li>
-                                <li><strong>Red horizontal line</strong>: Baseline (equal performance)</li>
+                                <li><strong>Speedup vs PyTorch</strong>: How many times faster Triton is compared to PyTorch</li>
+                                <li><strong>Baseline (Equal Performance)</strong>: Reference line at y=1.0</li>
                             </ul>
                         </div>
                         """
@@ -311,7 +303,7 @@ def create_combined_plots(source_dir='results', output_dir='organized_results'):
 
 def create_combined_plot_for_param(param, csv_files, output_dir):
     """Create a combined plot for a specific parameter from multiple CSV files"""
-    plt.figure(figsize=(12, 8), dpi=150)
+    plt.figure(figsize=(10, 6), dpi=150)
     
     # Use different markers and colors for different runs
     markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*']
@@ -324,8 +316,7 @@ def create_combined_plot_for_param(param, csv_files, output_dir):
             
             # Extract data
             x_vals = df[param].values
-            # Handle potential string formatting in the Triton time column
-            triton_times = pd.to_numeric(df['Triton (ms)'].str.replace('ms', ''), errors='coerce')
+            triton_times = df['Triton (ms)'].values
             
             # Plot with different style for each run
             marker = markers[i % len(markers)]
