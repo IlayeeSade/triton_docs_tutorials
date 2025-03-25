@@ -247,8 +247,8 @@ def _lsemm_kernel(
         num_masked_v = tl.sum(1 - (mask_v))
         # num_nmasked_n = tl.sum(mask_n)
 
-        a = tl.load(c_ptr + a_offsets, mask=mask_a, other=0.0)
-        b = tl.load(e_ptr + b_offsets, mask=mask_b, other=0.0)
+        a = tl.load(c_ptr + a_offsets, mask=mask_a, other=float('-inf'))
+        b = tl.load(e_ptr + b_offsets, mask=mask_b, other=float('-inf'))
         
         # a @ b => (BV, BN) and we need to sum over BV
 
@@ -267,10 +267,6 @@ def _lsemm_kernel(
         matmul_res -= block_cmx[None, :]
     
         acc += tl.sum(tl.exp(matmul_res), axis=0) # (BN,) 
-
-        correction_term = tl.exp(-block_cmx) * num_masked_v
-        # Unlawfully adding themselved into the sum of the matrices
-        acc -= correction_term
 
         a_offsets += BLOCK_SIZE_D * stride_cd
         b_offsets += BLOCK_SIZE_D * stride_ed
@@ -304,12 +300,14 @@ def _lsemm_kernel(
     cexpc, cexpg = tl.exp(block_cmx - block_gmx), tl.exp(block_gmx - block_cmx)
     keep_mask = block_gmx >= block_cmx
     block_gmx = tl.where(keep_mask, block_gmx, block_cmx)
-    buffer = tl.where(keep_mask, block_acc, acc)
+    # sum(exp(z_i - block_cmx) * exp(block_cmx - block_gmx) = sum(exp(z_i - block_cmx + block_cmx - block_gmx)
+    corspt = tl.where(keep_mask, block_acc, acc)
+
     block_acc = tl.where(keep_mask, acc * cexpc, block_acc * cexpg)
     # depending on the mask, (1) if gmx greater/equal, (2) else
     # (1) Now acc holds sum(exp(z_i - block_gmx)) , shape (BLOCK_SIZE_N,)
     # (2) Now block_acc holds sum(exp(z_block - block_cmx)), shape(BLOCK_SIZE_N)
-    block_acc = buffer + block_acc
+    block_acc = corspt + block_acc
     # Now everything is summed and holds the max, not holds, more like holds the effect
     tl.store(ointermediate_ptrs, block_acc, mask=mask_o)
     tl.store(maxes_ptrs, block_gmx, mask=mask_m) # Store the maxes of the maxes of the block
