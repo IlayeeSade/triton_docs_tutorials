@@ -221,6 +221,7 @@ def _lsemmo_kernel(
     a_offsets = offsets_V[:, None] * stride_cv + offsets_D[None, :] * stride_cd # (BV, BD)
     b_offsets = offsets_D[:, None] * stride_ed + offsets_N[None, :] * stride_en # (BD, BN)
 
+    accb = tl.zeros((BLOCK_SIZE_V, BLOCK_SIZE_N,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
     block_cmx = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # current max
     block_gmx = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # global max of block currently
@@ -233,44 +234,30 @@ def _lsemmo_kernel(
         
     for d in range(0, tl.cdiv(D, BLOCK_SIZE_D), num_stages=num_stages):
         mask_d = offsets_D < D - d * BLOCK_SIZE_D
-
         mask_a = mask_v[:, None] & mask_d[None, :]
         mask_b = mask_d[:, None] & mask_n[None, :]
-
-        # Masked elements in the matmul that affect the final result
-        # Are the ones below the true elements in the result matrix
-        # and left to finish of the true elements
-        # So we can calculate this and remove their effect
-
-        # num_masked_v * (BN - num_masked_n), these are the number of those who have effect
-
-        num_masked_v = tl.sum(1 - (mask_v))
-        # num_nmasked_n = tl.sum(mask_n)
 
         a = tl.load(c_ptr + a_offsets, mask=mask_a, other=0.0)
         b = tl.load(e_ptr + b_offsets, mask=mask_b, other=0.0)
         
         # a @ b => (BV, BN) and we need to sum over BV
-
-        # Given a maximum of a two matrices, their largest entry in their
-        # matmul is at most shared_dim * max1 * max2
-        # let's heuristically/randomly assume that for numerical stability and 
-        # there will be no problem of gradients, but the LR or something might need to compensate
-        # for the irregular order of the graidents.
-        # NVM no need to do this, a mistake on my side
-            # guess_factor = 4
-            # mx1, mx2 = tl.max(a), tl.max(b)
-            # correction_term = mx1 * mx2 * (BLOCK_SIZE_D / guess_factor)
-                           
-        matmul_res = tl.dot(a, b) # (BLOCK_SIZE_V, BLOCK_SIZE_N)
-        block_cmx = tl.max(matmul_res, axis=0) # (BN,)
-        matmul_res -= block_cmx[None, :]
+        accb = tl.dot(a, b, acc=accb) # (BLOCK_SIZE_V, BLOCK_SIZE_N)
     
-        acc += tl.sum(tl.exp(matmul_res), axis=0) # (BN,) 
-
         a_offsets += BLOCK_SIZE_D * stride_cd
         b_offsets += BLOCK_SIZE_D * stride_ed
 
+    # Masked elements in the matmul that affect the final result
+    # Are the ones below the true elements in the result matrix
+    # and left to finish of the true elements
+    # So we can calculate this and remove their effect
+    # num_masked_v * (BN - num_masked_n), these are the number of those who have effect
+    # num_nmasked_n = tl.sum(mask_n)
+    num_masked_v = tl.sum(1 - (mask_v))
+
+    block_cmx = tl.max(accb, axis=0) # (BN,)
+    accb -= block_cmx[None, :]
+    acc += tl.sum(tl.exp(accb), axis=0) # (BN,)
+    acc -= num_masked_v * tl.exp(-block_cmx)
     acc = tl.log(acc)
 
     # Now acc holds log(sum(exp(z_i - block_cmx))) while the real result is
@@ -455,7 +442,7 @@ def lsemm(E, C):
     locks = torch.zeros(2 * L, dtype=torch.int32, device=E.device)
     
     grid = lambda meta: (triton.cdiv(V, meta['BLOCK_SIZE_V']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
-    _lsemm_kernel[grid](
+    _lsemmo_kernel[grid](
         E, C, O, locks, M,
         N, D, V, L,
         E.stride(0), E.stride(1),
