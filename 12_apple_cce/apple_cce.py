@@ -189,8 +189,8 @@ autotune_configs_lsemm = [
 def _lsemmo_kernel(
     e_ptr, c_ptr, output_ptr, locks_ptr, maxes_ptr,
     N, D, V, L,
-    stride_ed, stride_en,
     stride_cv, stride_cd,
+    stride_ed, stride_en,
     stride_on, stride_ll,
     stride_miv,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_D: tl.constexpr, BLOCK_SIZE_V: tl.constexpr,
@@ -224,7 +224,6 @@ def _lsemmo_kernel(
     accb = tl.zeros((BLOCK_SIZE_V, BLOCK_SIZE_N,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
     block_cmx = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # current max
-    block_gmx = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # global max of block currently
     cexpc, cexpg = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32), tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32) # correcting shit later
     # These are multipliers that affect exisiting sums to make their max-num precision subtraction
     # global, to take the largest max
@@ -255,9 +254,9 @@ def _lsemmo_kernel(
     num_masked_v = tl.sum(1 - (mask_v))
 
     block_cmx = tl.max(accb, axis=0) # (BN,)
+    accb = tl.where(mask_v[:, None], accb, float('-inf'))
     accb -= block_cmx[None, :]
     acc += tl.sum(tl.exp(accb), axis=0) # (BN,)
-    acc -= num_masked_v * tl.exp(-block_cmx)
     acc = tl.log(acc)
 
     # Now acc holds log(sum(exp(z_i - block_cmx))) while the real result is
@@ -266,39 +265,39 @@ def _lsemmo_kernel(
     maxes_ptrs = maxes_ptr + offsets_M * stride_miv
     ointermediate_ptrs = output_ptr + offsets_O * stride_on
     
-    mask_m = (offsets_M < N)
+    mask_m = (offsets_M < N)   
     mask_o = (offsets_O < N)
 
-    # count_ptr = locks_ptr + L * num_PID_along_N * stride_ll
     lock_id = PID_N
-    while tl.atomic_cas(locks_ptr + lock_id * stride_ll, 0, 1) == 1:
+    locks_ptrf = locks_ptr + lock_id * stride_ll
+    count_ptr = locks_ptr + (L + lock_id) * stride_ll
+    while tl.atomic_cas(locks_ptrf, 0, 1) == 1:
         pass
 
     # Saving useless addition
-    # count = tl.load(count_ptr)
-    # if count == 0:
-    #     tl.atomic_xchg(count_ptr, 1)
-    # else:
+    count = tl.load(count_ptr)
+    if count == 0:
+        tl.atomic_xchg(count_ptr, 1)
+        tl.store(ointermediate_ptrs, acc, mask=mask_o)
+        tl.store(maxes_ptrs, block_cmx, mask=mask_m) # Store the maxes of the maxes of the block
+    else:
+        # We basically keep the maximum here at all times
+        block_acc = tl.load(ointermediate_ptrs, mask=mask_o) # Holds sum(exp(z_block - block_gmx))
+        block_gmx = tl.atomic_max(maxes_ptrs, block_cmx, mask_m)
+        block_bmx = tl.load(maxes_ptrs, mask_m)
+        # block_acc = tl.exp(block_acc) # block_acc holds sum(exp(z_block - block_gmx))
 
-    # We basically keep the maximum here at all times
-    block_gmx = tl.load(maxes_ptrs, mask=mask_m, other=float('-inf'))
-    block_acc = tl.load(ointermediate_ptrs, mask=mask_o) # Holds sum(exp(z_block - block_gmx))
-    # block_acc = tl.exp(block_acc) # block_acc holds sum(exp(z_block - block_gmx))
+        cexpc, cexpg = block_cmx - block_bmx, block_gmx - block_bmx
+        # sum(exp(z_i - block_cmx) * exp(block_cmx - block_gmx) = sum(exp(z_i - block_cmx + block_cmx - block_gmx)
+        acc += cexpc
+        block_acc += cexpg
+        # depending on the mask, (1) if gmx greater/equal, (2) else
+        # (1) Now acc holds sum(exp(z_i - block_gmx)) , shape (BLOCK_SIZE_N,)
+        # (2) Now block_acc holds sum(exp(z_block - block_cmx)), shape(BLOCK_SIZE_N)
+        acc = tl.exp(acc) + tl.exp(block_acc)
+        # Now everything is summed and holds the max, not holds, more like holds the effect
+        tl.store(ointermediate_ptrs, tl.log(acc), mask=mask_o)
 
-    cexpc, cexpg = block_cmx - block_gmx, block_gmx - block_cmx
-    keep_mask = block_gmx >= block_cmx
-    block_gmx = tl.where(keep_mask, block_gmx, block_cmx)
-    # sum(exp(z_i - block_cmx) * exp(block_cmx - block_gmx) = sum(exp(z_i - block_cmx + block_cmx - block_gmx)
-    corspt = tl.where(keep_mask, block_acc, acc)
-
-    block_acc = tl.where(keep_mask, acc + cexpc, block_acc + cexpg)
-    # depending on the mask, (1) if gmx greater/equal, (2) else
-    # (1) Now acc holds sum(exp(z_i - block_gmx)) , shape (BLOCK_SIZE_N,)
-    # (2) Now block_acc holds sum(exp(z_block - block_cmx)), shape(BLOCK_SIZE_N)
-    block_acc = tl.exp(corspt) + tl.exp(block_acc)
-    # Now everything is summed and holds the max, not holds, more like holds the effect
-    tl.store(ointermediate_ptrs, tl.log(block_acc), mask=mask_o)
-    tl.store(maxes_ptrs, block_gmx, mask=mask_m) # Store the maxes of the maxes of the block
     tl.atomic_xchg(locks_ptr + lock_id * stride_ll, 0) # Unlock
 
 @triton.autotune(configs=autotune_configs_lsemm, key=['N', 'D', 'V'])
@@ -306,8 +305,8 @@ def _lsemmo_kernel(
 def _lsemm_kernel(
     e_ptr, c_ptr, output_ptr, locks_ptr, maxes_ptr,
     N, D, V, L,
-    stride_ed, stride_en,
     stride_cv, stride_cd,
+    stride_ed, stride_en,
     stride_on, stride_ll,
     stride_miv,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_D: tl.constexpr, BLOCK_SIZE_V: tl.constexpr,
@@ -445,13 +444,13 @@ def lsemm(E, C):
     _lsemmo_kernel[grid](
         E, C, O, locks, M,
         N, D, V, L,
-        E.stride(0), E.stride(1),
         C.stride(0), C.stride(1),
+        E.stride(0), E.stride(1),
         O.stride(0), locks.stride(0),
         M.stride(0),
     )
     # Now add the maxes changes and log it
-    return torch.log(O), M
+    return torch.log(O) + M
 
 @torch.compile
 def torch_lsemm(E, C):
@@ -462,7 +461,7 @@ def torch_lsemm(E, C):
     mx = torch.max(RES, dim=0, keepdim=True)[0]  # Shape: (1, N)
     RES = RES - mx  # Broadcasting: (V, N) - (1, N)
     RES = torch.sum(torch.exp(RES), dim=0)  # Sum over V dimension, result shape: (N,)
-    return torch.log(RES), mx  # Add back the maxes
+    return torch.log(RES) + mx  # Add back the maxes
 
 def test_lsemm(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
     # create input data
@@ -472,8 +471,8 @@ def test_lsemm(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
     E = torch.randn([D, N], device=device)
     C = torch.randn([V, D], device=device)
     # run kernel & pytorch reference implementation
-    c_tri, m_tri = lsemm(E, C)
-    c_ref, m_ref = torch_lsemm(E, C)
+    c_tri = lsemm(E, C)
+    c_ref = torch_lsemm(E, C)
     # compare
     print(c_tri)
     print(c_ref)
