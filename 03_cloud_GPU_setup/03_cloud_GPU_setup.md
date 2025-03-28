@@ -29,10 +29,10 @@ gh repo clone your_github_username/triton_docs_tutorials
 ```
 7. setup your git user email and username
 ```
-git config --global user.email "your_github_email@email.com"
+git config --global user.email "ilayeesade@gmail.com"
 ```
 ```
-git config --global user.name "your_github_username"
+git config --global user.name "IlayeeSade"
 ```
 8. now you can make changes and push updates as usual all through the jupyterlab environment's terminal. Note that unless you also setup a filesystem before intializing your GPU instance that everything will be deleted when you close out the instance, so don't forget to push your changes to github!
 9. install all necessary packages
