@@ -33,8 +33,8 @@ def _superlinear_kernel(
     stride_wm, stride_wh, stride_wd,
     stride_bd, stride_bh,
     stride_ob, stride_od, stride_oh,
-    stride_mup, stride_mum,
-    stride_sip, stride_sim,
+    stride_mup, stride_mub,
+    stride_sip, stride_sib,
     stride_lop,
     BLOCK_SIZE_B : tl.constexpr,
     BLOCK_SIZE_D : tl.constexpr,
@@ -44,6 +44,10 @@ def _superlinear_kernel(
     num_stages : tl.constexpr,
     
 ):
+    # Get program IDs - each program handles one (B_block, D, H_block) tile
+    pid_b = tl.program_id(axis=0)  
+    pid_d = tl.program_id(axis=1)  
+    pid_h = tl.program_id(axis=2)
     # Superlinear part 1 ---------------- (LAYERNORM CALCULATION)
     # We need an 2 (M, ) accumulators one for mean and for std.
     # We want to sum over each kernel b_m, each also have a designated neuron, pid_d
@@ -51,41 +55,75 @@ def _superlinear_kernel(
     # So we sum over our b_m in b_b in index d and add it to the shared acc of the
     # programs index d, we will have an acc for each index d and we will sum it like a tournament
 
-    offs_x1 = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
-    offs_x2 = tl.arange(0, M)
-    x_ptrs = x_ptr + (offs_x1[:, None] * stride_xb +
-                        pid_d * stride_xd +
-                        offs_x2[None, :] * stride_xm)
+    offs_b = tl.arange(0, BLOCK_SIZE_B)
+    offs_m = tl.arange(0, M)
+    # Wait for all programs to reach this point before proceeding   
 
-    mask_s = (offs_x1 < (pid_b + 1) * BLOCK_SIZE_B)[:, None] + (offs_x2 < M)[None, :]
-    slice1 = tl.load(x_ptrs, mask=mask_s, other=0.0)
-    acc = tl.zeros((M,), dtype=tl.float32)
-    acc = acc + tl.sum(slice1, (0,))
+    cur_sz = 1
+    acmu = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
+    if (pid_h == 0):
+        while cur_sz <= tl.next_power_of_2(D) // 2:
+            if pid_d % (cur_sz * 2) == 0:
+                acmu = tl.sum(
+                        tl.load(
+                            x_ptr + (
+                                (cur_sz + pid_d) * stride_xd +
+                                offs_b * stride_xb[:, None] + 
+                                offs_m * stride_xm[None, :]
+                                
+                            ),
+                            mask=((offs_b < B)[:, None] & (offs_m < M)[None, :]), 
+                            other=0.0
+                        ),
+                        axis=0,
+                    )
+                tl.atomic_add(
+                    mu_ptr + (
+                        pid_d * stride_mup +
+                        offs_b * stride_mub
+                    ),
+                    acmu
+                )
+                cur_sz = cur_sz * 2
 
-    acc_ptrs = mu_ptr + offs_x2 * stride_mum + pid_d * stride_mup
-    tl.atomic_add(acc_ptrs, acc, mask=offs_x2 < M)
-    # Wait for all programs to reach this point before proceeding
+    cur_sz = 1
+    tl.debug_barrier()
+    
+
+    mu = tl.load(
+        mu_ptr + (
+            offs_b * stride_mub
+        ),
+        mask=offs_b < B,
+        other=0.0
+    ) / (M * D)
+
+    if (pid_h == 0):
+        while cur_sz <= tl.next_power_of_2(D) // 2:
+            if pid_d % (cur_sz * 2) == 0:
+                acmu = acmu - mu
+                acmu = acmu * acmu
+                tl.atomic_add(
+                    si_ptr + (
+                        pid_d * stride_sip +
+                        offs_b * stride_sib
+                    ),
+                    acmu
+                )
+                cur_sz = cur_sz * 2
+
     tl.debug_barrier()
 
-    lo_ptrs = lo_ptr
+    std = tl.load(
+        si_ptr + (
+            offs_b * stride_sib
+        ),
+        mask=offs_b < B,
+        other=0.0
+    ) / (M * D)
+    std = tl.sqrt(std)    
 
-    while tl.atomic_cas(lo_ptrs, 0, 1) != 0:
-        pass
-    
-
-    tosum = tl.load(
-        mu_ptr + (
-            offs
-            offs_x2
-        )
-    )
-    
-
-    # Superlinear part 2 ---------------- (SUPERLINEAR CALCULATION)
-    # Get program IDs - each program handles one (B_block, D, H_block) tile
-    pid_b = tl.program_id(axis=0)  
-    pid_d = tl.program_id(axis=1)  
-    pid_h = tl.program_id(axis=2)  
+    # Superlinear part 2 ---------------- (SUPERLINEAR CALCULATION)  
     
     # Calculate actual indices
     offs_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
@@ -108,7 +146,7 @@ def _superlinear_kernel(
                          pid_d * stride_xd + 
                          offs_m[None, :] * stride_xm)
         x_block = tl.load(x_ptrs, mask=mask_b[:, None] & mask_m[None, :], other=0.0)
-        
+        x_block = (x_block - mu[:, None]) / std[:, None] 
         # Load w1: shape (M, H, D) -> need w1[offs_m, offs_h, pid_d]
         w1_ptrs = w1_ptr + (offs_m[:, None] * stride_wm + 
                            offs_h[None, :] * stride_wh + 
@@ -162,8 +200,8 @@ def superlinear(
     assert len(b1.shape) == 3, f"b1 should be 3D tensor, got shape {b1.shape}"
 
 
-    mu = torch.zeros((D, M), device=DEVICE, dtype=torch.float32)
-    si = torch.zeros((D, M), device=DEVICE, dtype=torch.float32)
+    mu = torch.zeros((D, B), device=DEVICE, dtype=torch.float32)
+    si = torch.zeros((D, B), device=DEVICE, dtype=torch.float32)
     lo = torch.zeros((D,), device=DEVICE, dtype=torch.int32)
     O = torch.empty((B, D, H), device=DEVICE, dtype=torch.float32)
     
