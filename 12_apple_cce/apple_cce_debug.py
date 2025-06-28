@@ -153,7 +153,7 @@ def compare_implementations(V=64, D=64, N=64):
     c = C.cuda()
     O = torch.zeros((N,), device=e.device, dtype=torch.float32)
     M = torch.full((N,), float('-inf'), device=e.device, dtype=torch.float32)
-    L = math.ceil(N / BLOCK_SIZE_N)
+    L = math.ceil(V / BLOCK_SIZE_V)
     locks = torch.zeros(2 * L, dtype=torch.int32, device=e.device)
     
     # Configure grid
