@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from .helper_modules import DropoutWithMask
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
@@ -30,7 +31,6 @@ def _superlinear_d_kernel(
     b1_ptr,
     out_ptr,
     dp_ptr,
-    p,
     B, D, M : tl.constexpr, H,
     stride_xb, stride_xd, stride_xm,
     stride_wm, stride_wh, stride_wd,
@@ -43,7 +43,7 @@ def _superlinear_d_kernel(
     BLOCK_SIZE_H : tl.constexpr,
     GROUP_SIZE : tl.constexpr,
     num_stages : tl.constexpr,
-    
+    p: tl.constexpr,
 ):
     # Get program IDs - each program handles one (B_block, D, H_block) tile
     pid_b = tl.program_id(axis=0)  
@@ -58,6 +58,7 @@ def _superlinear_d_kernel(
 
     offs_B = pid_b + tl.arange(0, BLOCK_SIZE_B)
     offs_M = tl.arange(0, M)
+    offs_H = pid_h + tl.arange(0, BLOCK_SIZE_H)
 
     mu = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
     std = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
@@ -106,26 +107,33 @@ def _superlinear_d_kernel(
     w1 = tl.load(
         w1_ptr + (
             offs_M[:, None] * stride_wm + 
-            offs_h[None, :] * stride_wh + 
+            offs_H[None, :] * stride_wh + 
             pid_d * stride_wd
         ),
-        mask = (offs_M < M)[:, None] & (pid_d < D) & (offs_h < H),
+        mask = (offs_M < M)[:, None] & (pid_d < D) & (offs_H < H),
         other = 0.0
     )
 
     acc = tl.dot(x / std[:, None], w1, acc=acc, allow_tf32=False)
 
     # Add bias: b1 shape is (1, D, H) -> need b1[0, pid_d, offs_h]
-    b1_ptrs = b1_ptr + (pid_d * stride_bd + offs_h * stride_bh)
-    bias = tl.load(b1_ptrs, mask=mask_h, other=0.0)
+    bias = tl.load(
+        b1_ptr + (pid_d * stride_bd + offs_H * stride_bh),
+        mask = (offs_H < H) & (pid_d < D),
+        other = 0.0
+    )
     # Add bias (broadcast across batch dimension)
     acc = acc + bias[None, :]
         
     # Store result: out shape (B, D, H) -> store at out[offs_b, pid_d, offs_h]
-    out_ptrs = out_ptr + (offs_b[:, None] * stride_ob + 
+    out_ptrs = out_ptr + (offs_B[:, None] * stride_ob + 
                          pid_d * stride_od + 
-                         offs_h[None, :] * stride_oh)
-    tl.store(out_ptrs, acc, mask=mask_b[:, None] & mask_h[None, :])
+                         offs_H[None, :] * stride_oh)
+    tl.store(
+        out_ptrs,
+        acc,
+        mask=((offs_B < B)[:, None] & (offs_H < H)[None, :])
+    )
 
 @triton.autotune(configs=autotune_configs, key=['B', 'D', 'M', 'H'])
 @triton.jit
@@ -392,11 +400,85 @@ def superlinear_ln(
     return O
 
             
+def superlinear_d(
+        x, w1, b1, dp,
+        T=1.0,
+        do_norm=False,
+        dropout=0):
+    # x: (B, D, M) where D=d_model=N neurons in CTM, M=history/memory length
+    # w1: (M, H, D)
+    # b1: (1, D, H)
+    # einsum result: (B, D, H)
+
+    (B, D, M), (_, H, _) = x.shape, w1.shape
+
+    # Assertions for tensor shape compatibility
+    assert w1.shape[0] == x.shape[2], f"history-length mismatch: w1.shape[0]={w1.shape[0]} vs x.shape[2]={x.shape[2]}"
+    assert w1.shape[2] == x.shape[1], f"neuron-nb mismatch: w1.shape[2]={w1.shape[2]} vs x.shape[1]={x.shape[1]}"
+    assert b1.shape[0] == 1, f"b1 first dimension should be 1, got {b1.shape[0]}"
+    assert b1.shape[1] == x.shape[1], f"b1 second dimension mismatch: b1.shape[1]={b1.shape[1]} vs x.shape[1]={x.shape[1]}"
+    assert b1.shape[2] == w1.shape[1], f"b1 third dimension mismatch: b1.shape[2]={b1.shape[2]} vs w1.shape[1]={w1.shape[1]}"
+    
+    # Assertions for parameter validity
+    assert T > 0, f"Temperature T must be positive, got {T}"
+    assert 0 <= dropout <= 1, f"Dropout must be between 0 and 1, got {dropout}"
+    
+    # Assertions for tensor dimensions
+    assert len(x.shape) == 3, f"x should be 3D tensor, got shape {x.shape}"
+    assert len(w1.shape) == 3, f"w1 should be 3D tensor, got shape {w1.shape}"
+    assert len(b1.shape) == 3, f"b1 should be 3D tensor, got shape {b1.shape}"
+
+    O = torch.empty((B, D, H), device=DEVICE, dtype=torch.float32)
+    
+    grid = lambda meta: (triton.cdiv(B, meta['BLOCK_SIZE_B']), D, triton.cdiv(H, meta['BLOCK_SIZE_H']))
+    _superlinear_d_kernel[grid](
+        x, w1, b1, O, dp,
+        B, D, M, H,
+        x.stride(0), x.stride(1), x.stride(2),
+        w1.stride(0), w1.stride(1), w1.stride(2),
+    b1.stride(1), b1.stride(2),  # b1.stride(0) is skipped since first dim is 1
+        O.stride(0), O.stride(1), O.stride(2),
+        dp.stride(0), dp.stride(1), dp.stride(2),
+        dropout
+    )
+    
+    return O
+
 def einsum_superlinear(x, w1, b1, T):
     return torch.einsum('BDM,MHD->BDH', x, w1) + b1
 
 def einsum_superlinear_ln(x, w1, b1, T):
     ln = torch.nn.LayerNorm(x.shape[-1], device=DEVICE)
+    x = ln(x)
+    return torch.einsum('BDM,MHD->BDH', x, w1) + b1
+
+def einsum_superlinear_d_test(x, w1, b1, T, dropout=0.0, training=True):
+    """
+    SuperLinear einsum with layernorm and dropout mask, returns (output, mask).
+    Uses DropoutWithMask from helper_modules.
+    """
+    # Import here to avoid top-level import issue
+    # x: (B, D, M)
+    # w1: (M, H, D)
+    # b1: (1, D, H)
+    # Returns: (B, D, H), mask (same shape as x)
+    dropout_module = DropoutWithMask(p=dropout)
+    dropout_module.train(training)
+    x_dropped, mask = dropout_module(x)
+    # Apply LayerNorm over the last dimension (M)
+    ln = torch.nn.LayerNorm(x.shape[-1], device=x.device)
+    x_norm = ln(x_dropped)
+    out = torch.einsum('BDM,MHD->BDH', x_norm, w1) + b1
+    return out, mask
+
+def einsum_superlinear_d(x, w1, b1, T, dropout=0.0, training=True):
+    """
+    SuperLinear einsum with dropout before layernorm.
+    Applies dropout to x, then layernorm, then einsum.
+    """
+    if dropout > 0.0 and training:
+        x = torch.nn.functional.dropout(x, p=dropout, training=True)
+    ln = torch.nn.LayerNorm(x.shape[-1], device=x.device)
     x = ln(x)
     return torch.einsum('BDM,MHD->BDH', x, w1) + b1
 
@@ -494,6 +576,42 @@ def test_superlinear(test_type='both'):
                 
                 all_passed = False
     
+    return all_passed
+
+def test_superlinear_dropout(test_type='both'):
+    """Test function to compare einsum dropout implementation with Triton kernel using the same mask."""
+    print(f"Testing SuperLinear Dropout kernels vs einsum implementation (type: {test_type})...")
+    test_configs = [
+        (2, 64, 128, 32),
+        (4, 32, 64, 128),
+        (1, 128, 256, 64),
+        (8, 16, 32, 256),
+    ]
+    all_passed = True
+    for i, (B, D, M, H) in enumerate(test_configs):
+        print(f"\nTest {i+1}: B={B}, D={D}, M={M}, H={H}")
+        T = 2.0
+        dropout = 0.5
+        training = True
+        x = torch.randn(B, D, M, device=DEVICE, dtype=torch.float32)
+        w1 = torch.randn(M, H, D, device=DEVICE, dtype=torch.float32)
+        b1 = torch.randn(1, D, H, device=DEVICE, dtype=torch.float32)
+        # Einsum dropout test (returns output, mask)
+        out_einsum, mask = einsum_superlinear_d_test(x, w1, b1, T, dropout=dropout, training=training)
+        # Kernel dropout test, use the same mask
+        out_kernel = superlinear_d(x, w1, b1, mask, T, dropout=dropout)
+        diff = torch.abs(out_einsum - out_kernel).max().item()
+        mean_diff = torch.abs(out_einsum - out_kernel).mean().item()
+        rel_error = (torch.abs(out_einsum - out_kernel) / (torch.abs(out_einsum) + 1e-8)).max().item()
+        print(f"    Max difference: {diff:.6f}")
+        print(f"    Mean difference: {mean_diff:.6f}")
+        print(f"    Max relative error: {rel_error:.6f}")
+        tolerance = 1e-3
+        if diff < tolerance:
+            print("    ✅ Dropout kernel test passed: Kernel matches einsum implementation with mask")
+        else:
+            print("    ❌ Dropout kernel test failed: Kernel differs from einsum implementation with mask")
+            all_passed = False
     return all_passed
 
 def benchmark_superlinear(benchmark_type='both'):
@@ -610,6 +728,54 @@ def benchmark_superlinear(benchmark_type='both'):
     
     return results
 
+def benchmark_superlinear_dropout(benchmark_type='both'):
+    """Benchmark SuperLinear dropout kernel vs einsum implementation (using random mask for kernel)."""
+    print(f"\nBenchmarking SuperLinear Dropout kernels vs einsum implementation (type: {benchmark_type})...")
+    configs = [
+        (1, 16, 2, 8), (2, 32, 4, 16), (4, 64, 8, 32), (8, 128, 16, 64),
+        (16, 256, 32, 128), (32, 512, 64, 256), (64, 1024, 128, 512), (128, 2048, 256, 1024),
+    ]
+    results = []
+    for B, D, M, H in configs:
+        print(f"\n{'='*60}")
+        print(f"Testing: B={B}, D={D}, M={M}, H={H}")
+        print(f"Total elements: {B*D*M:,} (input), {B*D*H:,} (output)")
+        print(f"Memory usage: ~{B*D*M*4/1024/1024:.1f}MB (input), ~{B*D*H*4/1024/1024:.1f}MB (output)")
+        print(f"Weight tensor: {M*H*D:,} elements (~{M*H*D*4/1024/1024:.1f}MB)")
+        print('='*60)
+        x = torch.randn(B, D, M, device=DEVICE, dtype=torch.float32)
+        w1 = torch.randn(M, H, D, device=DEVICE, dtype=torch.float32)
+        b1 = torch.randn(1, D, H, device=DEVICE, dtype=torch.float32)
+        dropout = 0.5
+        training = True
+        # Warmup
+        print("Warming up...")
+        for _ in range(10):
+            if benchmark_type in ['both', 'einsum']:
+                einsum_superlinear_d(x, w1, b1, 1.0, dropout=dropout, training=training)
+            if benchmark_type in ['both', 'kernel']:
+                mask = (torch.rand_like(x) > dropout).float()
+                superlinear_d(x, w1, b1, mask, 1.0, dropout=dropout)
+        quantiles = [0.5, 0.05, 0.95]
+        result = {'shape': (B, D, M, H), 'total_elements': B*D*M, 'memory_mb': B*D*M*4/1024/1024}
+        if benchmark_type in ['both', 'einsum']:
+            print("Running dropout einsum benchmark...")
+            einsum_ms, einsum_min_ms, einsum_max_ms = triton.testing.do_bench(
+                lambda: einsum_superlinear_d(x, w1, b1, 1.0, dropout=dropout, training=training),
+                quantiles=quantiles
+            )
+            result.update({'einsum_dropout': (einsum_ms, einsum_min_ms, einsum_max_ms)})
+        if benchmark_type in ['both', 'kernel']:
+            print("Running dropout kernel benchmark...")
+            mask = (torch.rand_like(x) > dropout).float()
+            kernel_ms, kernel_min_ms, kernel_max_ms = triton.testing.do_bench(
+                lambda: superlinear_d(x, w1, b1, mask, 1.0, dropout=dropout),
+                quantiles=quantiles
+            )
+            result.update({'kernel_dropout': (kernel_ms, kernel_min_ms, kernel_max_ms)})
+        results.append(result)
+    return results
+
 # Parse command line arguments
 def parse_args():
     parser = argparse.ArgumentParser(description='SuperLinear CTM Testing and Benchmarking')
@@ -617,8 +783,10 @@ def parse_args():
                        help='Which kernels to test: both, basic (no layernorm), or layernorm')
     parser.add_argument('--benchmark', choices=['both', 'basic', 'layernorm'], default='both',
                        help='Which kernels to benchmark: both, basic (no layernorm), or layernorm')
-    parser.add_argument('--skip-tests', action='store_true',
-                       help='Skip testing and go directly to benchmarking')
+    parser.add_argument('--test-dropout', action='store_true', help='Test dropout einsum vs kernel')
+    parser.add_argument('--benchmark-dropout', action='store_true', help='Benchmark dropout einsum vs kernel')
+    parser.add_argument('--dropout-type', choices=['both', 'einsum', 'kernel'], default='both', help='Which dropout variant to test/benchmark')
+    parser.add_argument('--skip-tests', action='store_true', help='Skip testing and go directly to benchmarking')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -687,3 +855,37 @@ if __name__ == "__main__":
                 print(f"{f'B={B},D={D},M={M},H={H}':<25} {basic_speedup:<15.2f}x {layernorm_speedup:<20.2f}x {ratio:<20.2f}")
     else:
         print("Skipping benchmarks due to test failure")
+
+    if args.test_dropout:
+        test_passed = test_superlinear_dropout(args.dropout_type)
+        if not test_passed:
+            print("\n❌ Some dropout tests failed. Skipping benchmarks.")
+            exit(1)
+        else:
+            print("\n✅ All dropout tests passed!")
+    elif not args.skip_tests:
+        test_passed = test_superlinear(args.test)
+        if not test_passed:
+            print("\n❌ Some tests failed. Skipping benchmarks.")
+            exit(1)
+        else:
+            print("\n✅ All tests passed!")
+    else:
+        print("\n⏭️  Skipping tests as requested.")
+        test_passed = True
+    if args.benchmark_dropout and test_passed:
+        benchmark_results = benchmark_superlinear_dropout(args.dropout_type)
+        print("\n" + "="*100)
+        print("DROPOUT BENCHMARK SUMMARY")
+        print("="*100)
+        for result in benchmark_results:
+            B, D, M, H = result['shape']
+            elements = result['total_elements']
+            memory = result['memory_mb']
+            weight_mb = M*H*D*4/1024/1024
+            einsum_ms = result.get('einsum_dropout', (None,))[0]
+            kernel_ms = result.get('kernel_dropout', (None,))[0]
+            print(f"{f'B={B},D={D},M={M},H={H}':<25} {elements:<12,} {memory:<10.1f}MB {weight_mb:<10.1f}MB Einsum: {einsum_ms}ms Kernel: {kernel_ms}ms")
+    elif test_passed:
+        benchmark_results = benchmark_superlinear(args.benchmark)
+        # ... (rest unchanged)
