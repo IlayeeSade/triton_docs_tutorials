@@ -1,0 +1,63 @@
+cur_sz = 1
+acmu = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
+if (pid_h == 0):
+    while cur_sz <= tl.next_power_of_2(D) // 2:
+        if pid_d % (cur_sz * 2) == 0:
+            acmu = tl.sum(
+                    tl.load(
+                        x_ptr + (
+                            (cur_sz + pid_d) * stride_xd +
+                            offs_b * stride_xb[:, None] + 
+                            offs_m * stride_xm[None, :]
+                            
+                        ),
+                        mask=((offs_b < B)[:, None] & (offs_m < M)[None, :]), 
+                        other=0.0
+                    ),
+                    axis=0,
+                )
+            tl.atomic_add(
+                mu_ptr + (
+                    pid_d * stride_mup +
+                    offs_b * stride_mub
+                ),
+                acmu
+            )
+            cur_sz = cur_sz * 2
+
+cur_sz = 1
+tl.debug_barrier()
+
+
+mu = tl.load(
+    mu_ptr + (
+        offs_b * stride_mub
+    ),
+    mask=offs_b < B,
+    other=0.0
+) / (M * D)
+
+if (pid_h == 0):
+    while cur_sz <= tl.next_power_of_2(D) // 2:
+        if pid_d % (cur_sz * 2) == 0:
+            acmu = acmu - mu
+            acmu = acmu * acmu
+            tl.atomic_add(
+                si_ptr + (
+                    pid_d * stride_sip +
+                    offs_b * stride_sib
+                ),
+                acmu
+            )
+            cur_sz = cur_sz * 2
+
+tl.debug_barrier()
+
+std = tl.load(
+    si_ptr + (
+        offs_b * stride_sib
+    ),
+    mask=offs_b < B,
+    other=0.0
+) / (M * D)
+std = tl.sqrt(std)

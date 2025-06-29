@@ -25,17 +25,11 @@ def _superlinear_kernel(
     w1_ptr,
     b1_ptr,
     out_ptr,
-    mu_ptr,
-    si_ptr,
-    lo_ptr,
     B, D, M, H,
     stride_xb, stride_xd, stride_xm,
     stride_wm, stride_wh, stride_wd,
     stride_bd, stride_bh,
     stride_ob, stride_od, stride_oh,
-    stride_mup, stride_mub,
-    stride_sip, stride_sib,
-    stride_lop,
     BLOCK_SIZE_B : tl.constexpr,
     BLOCK_SIZE_D : tl.constexpr,
     BLOCK_SIZE_M : tl.constexpr,
@@ -55,73 +49,37 @@ def _superlinear_kernel(
     # So we sum over our b_m in b_b in index d and add it to the shared acc of the
     # programs index d, we will have an acc for each index d and we will sum it like a tournament
 
-    offs_b = tl.arange(0, BLOCK_SIZE_B)
+    offs_b = pid_b + tl.arange(0, BLOCK_SIZE_B)
     offs_m = tl.arange(0, M)
-    # Wait for all programs to reach this point before proceeding   
 
-    cur_sz = 1
-    acmu = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
-    if (pid_h == 0):
-        while cur_sz <= tl.next_power_of_2(D) // 2:
-            if pid_d % (cur_sz * 2) == 0:
-                acmu = tl.sum(
-                        tl.load(
-                            x_ptr + (
-                                (cur_sz + pid_d) * stride_xd +
-                                offs_b * stride_xb[:, None] + 
-                                offs_m * stride_xm[None, :]
-                                
-                            ),
-                            mask=((offs_b < B)[:, None] & (offs_m < M)[None, :]), 
-                            other=0.0
-                        ),
-                        axis=0,
-                    )
-                tl.atomic_add(
-                    mu_ptr + (
-                        pid_d * stride_mup +
-                        offs_b * stride_mub
-                    ),
-                    acmu
-                )
-                cur_sz = cur_sz * 2
+    mu = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
+    std = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
+    placeholder = tl.zeros((BLOCK_SIZE_B, M), dtype=tl.float32)
 
-    cur_sz = 1
-    tl.debug_barrier()
+    placeholder = tl.load(
+        x_ptr + (
+            offs_b * stride_xb + 
+            pid_d * stride_xd +
+            offs_m * stride_xm
+        ),
+        mask = (offs_b < B) & (pid_d < D) & (offs_m < M),
+        other = 0.0
+    )
     
+    mu = tl.sum(
+        placeholder,
+        axis=1
+    ) / M
 
-    mu = tl.load(
-        mu_ptr + (
-            offs_b * stride_mub
-        ),
-        mask=offs_b < B,
-        other=0.0
-    ) / (M * D)
+    placeholder = placeholder - mu
 
-    if (pid_h == 0):
-        while cur_sz <= tl.next_power_of_2(D) // 2:
-            if pid_d % (cur_sz * 2) == 0:
-                acmu = acmu - mu
-                acmu = acmu * acmu
-                tl.atomic_add(
-                    si_ptr + (
-                        pid_d * stride_sip +
-                        offs_b * stride_sib
-                    ),
-                    acmu
-                )
-                cur_sz = cur_sz * 2
-
-    tl.debug_barrier()
-
-    std = tl.load(
-        si_ptr + (
-            offs_b * stride_sib
-        ),
-        mask=offs_b < B,
-        other=0.0
-    ) / (M * D)
-    std = tl.sqrt(std)    
+    std = tl.sqrt(
+        tl.sum(
+            placeholder * placeholder,
+            axis=1
+        ) / M
+        
+    )
 
     # Superlinear part 2 ---------------- (SUPERLINEAR CALCULATION)  
     
@@ -141,19 +99,18 @@ def _superlinear_kernel(
         offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
         mask_m = offs_m < M
 
-        # Load x: shape (B, D, M) -> need x[offs_b, pid_d, offs_m]
+        # Load x: shape (B, D, M) -> need x[offs_b, pid_d, offs_m] -> (B_B, B_M)
         x_ptrs = x_ptr + (offs_b[:, None] * stride_xb + 
                          pid_d * stride_xd + 
                          offs_m[None, :] * stride_xm)
         x_block = tl.load(x_ptrs, mask=mask_b[:, None] & mask_m[None, :], other=0.0)
         x_block = (x_block - mu[:, None]) / std[:, None] 
-        # Load w1: shape (M, H, D) -> need w1[offs_m, offs_h, pid_d]
+        # Load w1: shape (M, H, D) -> need w1[offs_m, offs_h, pid_d] -> (B_M, B_H)
         w1_ptrs = w1_ptr + (offs_m[:, None] * stride_wm + 
                            offs_h[None, :] * stride_wh + 
                            pid_d * stride_wd)
         w1_block = tl.load(w1_ptrs, mask=mask_m[:, None] & mask_h[None, :], other=0.0)
         
-        # Matrix multiplication: (BLOCK_SIZE_B, BLOCK_SIZE_M) @ (BLOCK_SIZE_M, BLOCK_SIZE_H)
         # Allow tf32 causes less precision but more speed up
         acc = tl.dot(x_block, w1_block, allow_tf32=False, acc=acc)
     
@@ -199,23 +156,16 @@ def superlinear(
     assert len(w1.shape) == 3, f"w1 should be 3D tensor, got shape {w1.shape}"
     assert len(b1.shape) == 3, f"b1 should be 3D tensor, got shape {b1.shape}"
 
-
-    mu = torch.zeros((D, B), device=DEVICE, dtype=torch.float32)
-    si = torch.zeros((D, B), device=DEVICE, dtype=torch.float32)
-    lo = torch.zeros((D,), device=DEVICE, dtype=torch.int32)
     O = torch.empty((B, D, H), device=DEVICE, dtype=torch.float32)
     
     grid = lambda meta: (triton.cdiv(B, meta['BLOCK_SIZE_B']), D, triton.cdiv(H, meta['BLOCK_SIZE_H']))
     _superlinear_kernel[grid](
-        x, w1, b1, O, mu, si, lo
+        x, w1, b1, O,
         B, D, M, H, 
         x.stride(0), x.stride(1), x.stride(2),
         w1.stride(0), w1.stride(1), w1.stride(2),
-        b1.stride(1), b1.stride(2),  # Note: b1.stride(0) is skipped since first dim is 1
+    b1.stride(1), b1.stride(2),  # b1.stride(0) is skipped since first dim is 1
         O.stride(0), O.stride(1), O.stride(2),
-        mu.stride(0), mu.stride(1),
-        si.stride(0), si.stride(1),
-        lo.stride(0),
     )
     
     return O
