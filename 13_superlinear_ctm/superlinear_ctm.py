@@ -16,9 +16,7 @@ autotune_configs = [
     triton.Config({'BLOCK_SIZE_B': 32, 'BLOCK_SIZE_D': 32, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_H': 64, 'GROUP_SIZE': 8, 'num_stages': 3}, num_warps=4),
     triton.Config({'BLOCK_SIZE_B': 64, 'BLOCK_SIZE_D': 64, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_H': 64, 'GROUP_SIZE': 8, 'num_stages': 3}, num_warps=4),
     triton.Config({'BLOCK_SIZE_B': 64, 'BLOCK_SIZE_D': 128, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_H': 64, 'GROUP_SIZE': 8, 'num_stages': 3}, num_warps=8),
-    triton.Config({'BLOCK_SIZE_B': 32, 'BLOCK_SIZE_D': 64, 'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_H': 32, 'GROUP_SIZE': 8, 'num_stages': 3}, num_warps=4),
-    triton.Config({'BLOCK_SIZE_B': 64, 'BLOCK_SIZE_D': 32, 'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_H': 64, 'GROUP_SIZE': 8, 'num_stages': 3}, num_warps=8),
-]
+    triton.Config({'BLOCK_SIZE_B': 128, 'BLOCK_SIZE_D': 128, 'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_H': 128, 'GROUP_SIZE': 8, 'num_stages': 3}, num_warps=8),]
 
 @triton.autotune(configs=autotune_configs, key=['B', 'D', 'M', 'H'])
 @triton.jit
@@ -676,7 +674,7 @@ def benchmark_superlinear_dropout(benchmark_type='both'):
         # Kernel timing
         print("Running dropout kernel benchmark...")
         kernel_ms, kernel_min_ms, kernel_max_ms = triton.testing.do_bench(
-            lambda: superlinear_d(x, w1, b1, None, 1.0, dropout=dropout),
+            lambda: superlinear_d(x, w1, b1, (torch.empty_like(x).uniform_() > dropout).to(torch.bool), 1.0, dropout=dropout),
             quantiles=quantiles
         )
         result.update({'kernel_dropout': (kernel_ms, kernel_min_ms, kernel_max_ms)})
