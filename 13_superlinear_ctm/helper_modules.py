@@ -11,17 +11,15 @@ class DropoutWithMask(nn.Module):
 
     def forward(self, x):
         if not self.training or self.p == 0.0:
-            mask = torch.ones_like(x, dtype=x.dtype, device=x.device)
+            mask = torch.ones_like(x, dtype=torch.int32, device=x.device)
             return x if self.inplace else x.clone(), mask
 
         # Generate dropout mask (1 where kept, 0 where dropped)
-        mask = torch.empty_like(x, dtype=x.dtype, device=x.device).bernoulli_(1 - self.p)
-
-        # Scale mask in-place
-        mask.div_(1 - self.p)
+        mask = (torch.empty_like(x, device=x.device).uniform_() < self.p).to(dtype=torch.bool)
 
         if self.inplace:
             x.mul_(mask)
+            x.mul_(1 / (1-self.p))
             return x, mask
         else:
-            return x * mask, mask
+            return x * mask * ((1/ (1-self.p))), mask
