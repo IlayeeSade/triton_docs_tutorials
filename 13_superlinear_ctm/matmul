@@ -1,0 +1,19 @@
+# Loop over M dimension - this is the reduction dimension
+for m_start in range(0, M, BLOCK_SIZE_M):
+    offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
+    mask_m = offs_m < M
+
+    # Load x: shape (B, D, M) -> need x[offs_b, pid_d, offs_m] -> (B_B, B_M)
+    x_ptrs = x_ptr + (offs_b[:, None] * stride_xb + 
+                        pid_d * stride_xd + 
+                        offs_m[None, :] * stride_xm)
+    x_block = tl.load(x_ptrs, mask=mask_b[:, None] & mask_m[None, :], other=0.0)
+    x_block = (x_block - mu[:, None]) / std[:, None] 
+    # Load w1: shape (M, H, D) -> need w1[offs_m, offs_h, pid_d] -> (B_M, B_H)
+    w1_ptrs = w1_ptr + (offs_m[:, None] * stride_wm + 
+                        offs_h[None, :] * stride_wh + 
+                        pid_d * stride_wd)
+    w1_block = tl.load(w1_ptrs, mask=mask_m[:, None] & mask_h[None, :], other=0.0)
+    
+    # Allow tf32 causes less precision but more speed up
+    acc = tl.dot(x_block, w1_block, allow_tf32=False, acc=acc)

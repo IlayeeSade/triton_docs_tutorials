@@ -34,6 +34,26 @@ import triton
 import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
+# Configuration system for choosing which kernels to test and benchmark
+KERNEL_CONFIG = {
+    'test_kernels': ['rbf1', 'rbf2'],  # List of kernels to test: 'rbf1', 'rbf2', 'rbf_custom'
+    'benchmark_kernels': ['rbf1', 'rbf2', 'torch'],  # List of kernels to benchmark: 'rbf1', 'rbf2', 'rbf_custom', 'torch'
+    'test_sizes': [(512, 512), (1024, 1024), (2048, 2048)],  # Sizes to test
+    'benchmark_sizes': [128 * i for i in range(2, 33)],  # Sizes to benchmark
+}
+
+def update_kernel_config(test_kernels=None, benchmark_kernels=None, test_sizes=None, benchmark_sizes=None):
+    """Update the kernel configuration for testing and benchmarking."""
+    global KERNEL_CONFIG
+    if test_kernels is not None:
+        KERNEL_CONFIG['test_kernels'] = test_kernels
+    if benchmark_kernels is not None:
+        KERNEL_CONFIG['benchmark_kernels'] = benchmark_kernels
+    if test_sizes is not None:
+        KERNEL_CONFIG['test_sizes'] = test_sizes
+    if benchmark_sizes is not None:
+        KERNEL_CONFIG['benchmark_sizes'] = benchmark_sizes
+
 ######### Step 3 #########
 
 # un-comment this to run a numpy emulation of Triton on CPU & be able to debug with print() statements
@@ -57,7 +77,13 @@ autotune_configs = [
     # High compute, deeper pipeline for large K
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=4, num_warps=8),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 4}, num_stages=4, num_warps=8),
-
+    # NEW: Large block size configurations for high-performance scenarios
+    triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE': 8}, num_stages=2, num_warps=16),
+    triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=2, num_warps=16),
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=2, num_warps=16),
+    # NEW: Very large block sizes for maximum throughput on large matrices
+    triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 512, 'BLOCK_SIZE_K': 256, 'GROUP_SIZE': 16}, num_stages=1, num_warps=32),
+    triton.Config({'BLOCK_SIZE_M': 1024, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE': 16}, num_stages=1, num_warps=32),
 ]
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator which consumes
 #   1) a list of `triton.Config` objects that define different configs of meta-parameters and compilation options
@@ -429,20 +455,53 @@ def test_rbf_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO do
     # create input data
     torch.manual_seed(0)
     assert type(size) == tuple and len(size) == 2
-    a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-    # run kernel & pytorch reference implementation
-    #print('BEFORE_1')
-    #c_tri1 = rbf1(a, b)
-    print('BEFORE_2')
-    c_tri2 = rbf2(a, b)
-    print('BEFORE_torch')
+    a = torch.randn((size[0], size[1]), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((size[1], size[0]), device=DEVICE, dtype=torch.float16)
+    
+    # run pytorch reference implementation
+    print(f'Testing with size {size}')
+    print('Running PyTorch reference...')
     c_ref = rbf_kernel(a, b)
-    # compare
-    #torch.testing.assert_close(c_tri1, c_ref, atol=atol, rtol=rtol)
-    #print("PASSED1")
-    torch.testing.assert_close(c_tri2, c_ref, atol=atol, rtol=rtol)
-    print("PASSED2")
+    
+    # Test each kernel based on configuration
+    for kernel_name in KERNEL_CONFIG['test_kernels']:
+        print(f'Testing {kernel_name}...')
+        if kernel_name == 'rbf1':
+            c_tri = rbf1(a, b)
+            torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
+            print(f"✅ {kernel_name} PASSED")
+        elif kernel_name == 'rbf2':
+            c_tri = rbf2(a, b)
+            torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
+            print(f"✅ {kernel_name} PASSED")
+        elif kernel_name == 'rbf_custom':
+            # For custom kernel, we need to provide configuration data
+            data = {
+                'M': size[0], 'N': size[0], 'K': size[1],
+                'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64,
+                'GROUP_SIZE': 8, 'num_stages': 4, 'num_warps': 8,
+            }
+            c_tri = rbf_custom(a, b, data)
+            torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
+            print(f"✅ {kernel_name} PASSED")
+        else:
+            print(f"❌ Unknown kernel: {kernel_name}")
+    
+    print("All configured kernels passed! 🎉")
+
+def run_all_tests():
+    """Run tests for all configured sizes and kernels."""
+    print("=" * 50)
+    print("RUNNING ALL TESTS")
+    print("=" * 50)
+    
+    for size in KERNEL_CONFIG['test_sizes']:
+        print(f"\nTesting size: {size}")
+        test_rbf_kernel(size=size)
+    
+    print("\n" + "=" * 50)
+    print("ALL TESTS COMPLETED")
+    print("=" * 50)
 
 ######### Step 4 #########
 configs = [
