@@ -32,7 +32,7 @@ def _w4a16_kernel(
     b_stride_0, b_stride_1,
     S_stride_0, S_stride_1,
     Z_stride_0, Z_stride_1,
-    OF, IF, B, group_size,
+    OF, IF, B, group_size, OFG,
     activations_stride_0, activations_stride_1,
     OUT_stride_0, OUT_stride_1,
     BLOCK_SIZE_OF: tl.constexpr, BLOCK_SIZE_IF: tl.constexpr, BLOCK_SIZE_B: tl.constexpr,
@@ -54,7 +54,10 @@ def _w4a16_kernel(
     PID_B = (PID % num_PID_in_group) // group_size_adj
 
     offsets_OF = PID_OF * BLOCK_SIZE_OF + tl.arange(0, BLOCK_SIZE_OF)
+    # repeating pointers because some are the same
     offsets_OF_G_adj = tl.arange(PID_OF * BLOCK_SIZE_OF, (PID_OF + 1) * BLOCK_SIZE_OF) // group_size
+    # did not group over this
+    offsets_IF_G_adj = tl.arange(0, BLOCK_SIZE_IF)
 
     offsets_B = PID_B * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
 
@@ -62,15 +65,25 @@ def _w4a16_kernel(
 
     offsets_OF_scales = offsets_OF[:, None] * S_stride_0 + offsets_IF[None, :] * S_stride_1
     
-    a_offsets = offsets_OF[:, None] * W_stride_0 + offsets_IF[None, :] * W_stride_1 # (OF, IF)
-    b_offsets = offsets_IF[:, None] * activations_stride_0 + offsets_B[None, :] * activations_stride_1 # (IF, B)
+    a_offsets = offsets_OF[:, None] * W_stride_0 + offsets_IF[None, :] * W_stride_1 # (OF block, IF block)
+    b_offsets = offsets_IF[:, None] * activations_stride_0 + offsets_B[None, :] * activations_stride_1 # (IF block, B block)
+
+    s_offsets = offsets_OF_G_adj[:, None] * S_stride_0 + offsets_IF_G_adj[None, :] * S_stride_1
+    z_offsets = offsets_OF_G_adj[:, None] * Z_stride_0 + offsets_IF_G_adj[None, :] * Z_stride_1
+
 
     # inputs tensors are fp16 but we accumulate into a block of fp32 values for higher accuracy (we'll revert later)
     accumulator = tl.zeros((BLOCK_SIZE_OF, BLOCK_SIZE_B), dtype=tl.float32) # the full OUT is shape (OF, B)
 
     for of in range(0, tl.cdiv(IF, BLOCK_SIZE_IF)):
         mask = offsets_IF < IF - of * BLOCK_SIZE_IF
+
+        sz_mask_0 = offsets_OF_G_adj < OFG
+        sz_mask_1 = offsets_IF_G_adj[None, :] < IF
+        sz_mask = sz_mask0[:, None] and sz_mask_1
+        
         W = tl.load(W_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_OF, BLOCK_SIZE_IF)
+        S = tl.load
         # notice the weights are packed 8-bit values, so we need to unpack them and dequantize them
               
         W_h = W & 0x0F * (1 - PID_half) + (W >> 4) & 0x0F * PID_half
@@ -94,7 +107,8 @@ def w4a16(W, b, S, Z, group_size, activations):
     # assertions
     assert W.shape[1] == activations.shape[0], "incompatible dimensions"
 
-    (OF, IF), (_, B) = W.shape, activations.shape
+    (OF, IF), (_, B), (_, OFG) = W.shape, activations.shape, S.shape
+
     OUT = torch.zeros((OF, B), device=W.device, dtype=torch.float16)
 
     grid = lambda meta: ((2 * triton.cdiv(OF, meta['BLOCK_SIZE_OF'])), triton.cdiv(B, meta['BLOCK_SIZE_B']))
@@ -104,7 +118,7 @@ def w4a16(W, b, S, Z, group_size, activations):
         b.stride(0), b.stride(1),
         S.stride(0), S.stride(1),
         Z.stride(0), Z.stride(1),
-        OF, IF, B, group_size,
+        OF, IF, B, group_size, OFG,
         activations.stride(0), activations.stride(1),
         OUT.stride(0), OUT.stride(1),
     )
