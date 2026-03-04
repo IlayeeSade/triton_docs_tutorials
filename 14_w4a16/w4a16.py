@@ -38,22 +38,28 @@ def _w4a16_kernel(
     BLOCK_SIZE_OF: tl.constexpr, BLOCK_SIZE_IF: tl.constexpr, BLOCK_SIZE_B: tl.constexpr,
     GROUP_SIZE: tl.constexpr,  num_stages: tl.constexpr,
 ):
-    # We want to matmul (OF, IF) @ (IF, B)
-    PID_OF = tl.program_id(axis=0) 
-    PID_B = tl.program_id(axis=1) 
-    PID_half = PID_OF // triton.cdiv(OF, meta['BLOCK_SIZE_OF']) 
+    raw_PID_OF = tl.program_id(axis=0)
+    raw_PID_B = tl.program_id(axis=1)
     
-    # Group-major ordering
     num_PID_along_OF = tl.cdiv(OF, BLOCK_SIZE_OF)
     num_PID_along_B = tl.cdiv(B, BLOCK_SIZE_B)
+    
+    PID_half = raw_PID_OF // num_PID_along_OF 
+    logical_PID_OF = raw_PID_OF % num_PID_along_OF
+    
+    PID = raw_PID_B * num_PID_along_OF + logical_PID_OF
+    
+    # Group-major ordering
     num_PID_in_group = GROUP_SIZE * num_PID_along_B
     group_id = PID // num_PID_in_group 
     first_PID_in_group_along_OF = group_id * GROUP_SIZE 
     group_size_adj = min(num_PID_along_OF - first_PID_in_group_along_OF, GROUP_SIZE) 
+    
     PID_OF = first_PID_in_group_along_OF + ((PID % num_PID_in_group) % group_size_adj)
     PID_B = (PID % num_PID_in_group) // group_size_adj
 
     offsets_OF = PID_OF * BLOCK_SIZE_OF + tl.arange(0, BLOCK_SIZE_OF)
+
     # repeating pointers because some are the same
     offsets_OF_G_adj = tl.arange(PID_OF * BLOCK_SIZE_OF, (PID_OF + 1) * BLOCK_SIZE_OF) // group_size
     # did not group over this
@@ -71,28 +77,33 @@ def _w4a16_kernel(
     s_offsets = offsets_OF_G_adj[:, None] * S_stride_0 + offsets_IF_G_adj[None, :] * S_stride_1
     z_offsets = offsets_OF_G_adj[:, None] * Z_stride_0 + offsets_IF_G_adj[None, :] * Z_stride_1
 
-
+    sz_mask_0 = offsets_OF_G_adj < OFG
     # inputs tensors are fp16 but we accumulate into a block of fp32 values for higher accuracy (we'll revert later)
     accumulator = tl.zeros((BLOCK_SIZE_OF, BLOCK_SIZE_B), dtype=tl.float32) # the full OUT is shape (OF, B)
 
     for of in range(0, tl.cdiv(IF, BLOCK_SIZE_IF)):
         mask = offsets_IF < IF - of * BLOCK_SIZE_IF
 
-        sz_mask_0 = offsets_OF_G_adj < OFG
-        sz_mask_1 = offsets_IF_G_adj[None, :] < IF
-        sz_mask = sz_mask0[:, None] and sz_mask_1
-        
+        sz_mask_1 = offsets_IF_G_adj < IF - of * BLOCK_SIZE_IF
+        sz_mask = sz_mask_0[:, None] & sz_mask_1[None, :]
+
+        S = tl.load(S_ptr + s_offsets, mask=sz_mask, other=0.0) # shape (BLOCK_SIZE_OF, BLOCK_SIZE_IF)
+        Z = tl.load(Z_ptr + z_offsets, mask=sz_mask, other=0.0) # shape (BLOCK_SIZE_OF, BLOCK_SIZE_IF)
         W = tl.load(W_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_OF, BLOCK_SIZE_IF)
-        S = tl.load
+
         # notice the weights are packed 8-bit values, so we need to unpack them and dequantize them
-              
-        W_h = W & 0x0F * (1 - PID_half) + (W >> 4) & 0x0F * PID_half
+        W_h = W & 0x0F * (1 - PID_half) + (W >> 4) & 0x0F * PID_half # saving branching
         W_h = W_h.to(tl.float16)
+        W_h -= Z
+        W_h *= S
+
         activations = tl.load(activations_ptr + b_offsets, mask=mask[:, None], other=0.0) # shape (BLOCK_SIZE_IF, BLOCK_SIZE_B)
         accumulator = tl.dot(W_h, activations, acc=accumulator)
 
         a_offsets += BLOCK_SIZE_IF * W_stride_1
         b_offsets += BLOCK_SIZE_IF * activations_stride_0
+        s_offsets += BLOCK_SIZE_IF * S_stride_1
+        z_offsets += BLOCK_SIZE_IF * Z_stride_1
 
     # and now we reset the data type to the expected output
     accumulator = accumulator.to(tl.float16)
