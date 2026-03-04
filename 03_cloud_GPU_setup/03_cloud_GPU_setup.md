@@ -25,7 +25,7 @@ gh auth login
 ```
 6. Clone your fork of this repository
 ```
-gh repo clone your_github_username/triton_docs_tutorials
+gh repo clone ilayeesade/triton_docs_tutorials
 ```
 7. setup your git user email and username
 ```
@@ -49,6 +49,13 @@ pip install --upgrade triton
 11. Once you're done with all changes pushed, make sure to logout so some random GPU provider doesn't have access to your github account
 ```
 gh auth logout
+```
+
+Addtionals:
+
+12. Getting your SSH Key
+```
+Get-Content $env:USERPROFILE\.ssh\id_rsa.pub | Set-Clipboard
 ```
 
 *note: if you're on an AMD GPU then this whole process should likely be the same, but throughout the repo you'll have to do your own research on the relatively small edits required to make your code more specifically efficient for your hardware. those edits can be found in the [original official triton docs tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html); i removed them from my version*
