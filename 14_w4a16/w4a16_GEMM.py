@@ -37,25 +37,46 @@ def _w4a16_kernel(
     BLOCK_SIZE_OF: tl.constexpr, BLOCK_SIZE_IF: tl.constexpr, BLOCK_SIZE_B: tl.constexpr,
     GROUP_SIZE: tl.constexpr, num_stages: tl.constexpr,
 ):
-    raw_PID_OF = tl.program_id(axis=0)
-    raw_PID_B = tl.program_id(axis=1)
+    # raw_PID_OF = tl.program_id(axis=0)
+    # raw_PID_B = tl.program_id(axis=1)
 
+    # num_PID_along_OF = tl.cdiv(OF, BLOCK_SIZE_OF)
+    # num_PID_along_B = tl.cdiv(B, BLOCK_SIZE_B)
+
+    # PID_half = raw_PID_OF // num_PID_along_OF
+    # logical_PID_OF = raw_PID_OF % num_PID_along_OF
+
+    # PID = raw_PID_B * num_PID_along_OF + logical_PID_OF
+
+    # # Group-major ordering
+    # num_PID_in_group = GROUP_SIZE * num_PID_along_B
+    # group_id = PID // num_PID_in_group
+    # first_PID_in_group_along_OF = group_id * GROUP_SIZE
+    # group_size_adj = min(num_PID_along_OF - first_PID_in_group_along_OF, GROUP_SIZE)
+
+    # PID_OF = first_PID_in_group_along_OF + ((PID % num_PID_in_group) % group_size_adj)
+    # PID_B = (PID % num_PID_in_group) // group_size_adj
+
+    #for some reason the former technique works better emprirically
+    #although this is modifies swizzling
+    Raw_PID = tl.program_id(axis=0)
     num_PID_along_OF = tl.cdiv(OF, BLOCK_SIZE_OF)
     num_PID_along_B = tl.cdiv(B, BLOCK_SIZE_B)
 
-    PID_half = raw_PID_OF // num_PID_along_OF
-    logical_PID_OF = raw_PID_OF % num_PID_along_OF
+    # we are making the corresponding PID in the other half be right afterwards
+    PID_half = Raw_PID % 2
+    PID = Raw_PID // 2
 
-    PID = raw_PID_B * num_PID_along_OF + logical_PID_OF
-
-    # Group-major ordering
     num_PID_in_group = GROUP_SIZE * num_PID_along_B
-    group_id = PID // num_PID_in_group
-    first_PID_in_group_along_OF = group_id * GROUP_SIZE
-    group_size_adj = min(num_PID_along_OF - first_PID_in_group_along_OF, GROUP_SIZE)
-
-    PID_OF = first_PID_in_group_along_OF + ((PID % num_PID_in_group) % group_size_adj)
+    group_id = PID // num_PID_in_group 
+    
+    first_PID_in_group_along_OF = group_id * GROUP_SIZE 
+    group_size_adj = min(num_PID_along_OF - first_PID_in_group_along_OF, GROUP_SIZE) 
+    
+    PID_OF = first_PID_in_group_along_OF + (PID % group_size_adj)
     PID_B = (PID % num_PID_in_group) // group_size_adj
+
+
 
     offsets_OF = PID_OF * BLOCK_SIZE_OF + tl.arange(0, BLOCK_SIZE_OF)
     offsets_B = PID_B * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
@@ -118,7 +139,7 @@ def w4a16(W, b, S, Z, group_size, activations):
 
     OUT = torch.zeros((2 * OF, B), device=W.device, dtype=torch.float16)
 
-    grid = lambda meta: ((2 * triton.cdiv(OF, meta['BLOCK_SIZE_OF'])), triton.cdiv(B, meta['BLOCK_SIZE_B']))
+    grid = lambda meta: ((2 * triton.cdiv(OF, meta['BLOCK_SIZE_OF'])) * triton.cdiv(B, meta['BLOCK_SIZE_B']), )
     _w4a16_kernel[grid](
         W, b, S, Z, activations, OUT,
         W.stride(0), W.stride(1),
@@ -282,10 +303,9 @@ if __name__ == "__main__":
 
     # 2) Benchmark sweep
     print("Running w4a16 benchmarks and generating plots...")
-    OF_vals = [512, 1024, 2048, 4096]
-    IF = 1024
+    OF_vals = [4096, 8192, 16384, 32768]
+    IF = 8192
     B = 256
-
     records = []
     for OF in OF_vals:
         shapes = (OF, IF, B)
@@ -311,25 +331,42 @@ if __name__ == "__main__":
     df = pd.DataFrame.from_records(records)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_csv = f"w4a16_benchmark_{timestamp}.csv"
+    results_csv = f"w4a16_gemm_benchmark_{timestamp}.csv"
     df.to_csv(results_csv, index=False)
     print(f"\nSaved benchmark data to {results_csv}")
 
-    plt.figure(figsize=(8, 5))
+    # Create a figure with two subplots side-by-side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Plot 1: TFLOPS vs OF
     for provider, label, color in [
         ("triton_w4a16", "Triton W4A16", "tab:blue"),
         ("torch_matmul_bias", "PyTorch matmul+bias", "tab:orange"),
     ]:
         sub = df[df["provider"] == provider]
-        plt.plot(sub["OF"], sub["tflops"], marker="o", label=label, color=color)
+        ax1.plot(sub["OF"], sub["tflops"], marker="o", label=label, color=color)
 
-    plt.xlabel("Output features (OF)")
-    plt.ylabel("TFLOPS (approximate)")
-    plt.title("W4A16 Triton kernel vs PyTorch matmul+bias")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
+    ax1.set_xlabel("Output features (OF)")
+    ax1.set_ylabel("TFLOPS (approximate)")
+    ax1.set_title("Throughput: W4A16 GEMM vs PyTorch FP16")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    # Plot 2: Execution Time (ms) vs OF
+    for provider, label, color in [
+        ("triton_w4a16", "Triton W4A16", "tab:blue"),
+        ("torch_matmul_bias", "PyTorch matmul+bias", "tab:orange"),
+    ]:
+        sub = df[df["provider"] == provider]
+        ax2.plot(sub["OF"], sub["ms"], marker="o", label=label, color=color)
+
+    ax2.set_xlabel("Output features (OF)")
+    ax2.set_ylabel("Execution Time (ms)")
+    ax2.set_title("Latency: W4A16 GEMM vs PyTorch FP16")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
 
     plot_path = f"w4a16_benchmark_{timestamp}.png"
     plt.tight_layout()
     plt.savefig(plot_path)
-    print(f"Saved performance plot to {plot_path}")
+    print(f"Saved performance plots to {plot_path}")
