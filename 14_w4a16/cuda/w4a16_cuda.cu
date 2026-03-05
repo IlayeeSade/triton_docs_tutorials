@@ -2,10 +2,17 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#define BLOCK_DIM_X 64
+#define BLOCK_DIM_Y 2
+
 // ---------------------------------------------------------
-// 1. The Optimized GEMV Kernel (B=1) using Parallel Reduction
+// 1. The VECTORIZED Shared Weight Broadcast Kernel
 // ---------------------------------------------------------
-__global__ void w4a16_gemv_optimized_kernel(
+
+// ---------------------------------------------------------
+// 1. The uint4 VECTORIZED Kernel (Maximum Bandwidth)
+// ---------------------------------------------------------
+__global__ void w4a16_gemv_uint4_kernel(
     const uint8_t* __restrict__ W_packed, 
     const half* __restrict__ b,           
     const half* __restrict__ S,           
@@ -14,79 +21,193 @@ __global__ void w4a16_gemv_optimized_kernel(
     half* __restrict__ OUT,               
     int OF, int IF, int group_size) 
 {
-    // 1 Block computes exactly 1 Output Feature (Row)
-    int current_of = blockIdx.x; 
+    int tx = threadIdx.x; 
+    int ty = threadIdx.y; 
+    int current_of_packed = blockIdx.x;
+    int row_idx = (current_of_packed * 2) + ty;
+
+    // THE UPGRADE: 128-bit memory transactions! (16 bytes at once)
+    // uses a 4-vector of uint32_t, but it now uses 1 instruction for looping while
+    // the previous things needed 4 instructions for looping
+    // and optimizes syncthreads, less total calls
+    const uint4* W_vec = reinterpret_cast<const uint4*>(W_packed);
     
-    // Thread ID within this block (0 to 255)
-    int tid = threadIdx.x;
+    // We loop 1/16th as many times now
+    int IF_vec = IF / 16; 
 
-    // Figure out which packed row we are reading from
-    int OF_packed = OF / 2;
-    int pid_half = current_of / OF_packed;          
-    int current_of_packed = current_of % OF_packed; 
+    // 16 activations per thread
+    __shared__ float shm_act[BLOCK_DIM_X * 16];
 
-    // Each thread holds its own partial sum in ultra-fast registers
     float partial_acc = 0.0f;
 
-    // STEP 1: Coalesced Grid-Stride Loop
-    for (int k = tid; k < IF; k += blockDim.x) {
-        
-        // Read the packed byte
-        uint8_t w_packed_val = W_packed[current_of_packed * IF + k];
-        
-        // Unpack based on which half of the output feature matrix we are in
-        uint8_t w_unpacked = (pid_half == 0) ? (w_packed_val & 0x0F) : ((w_packed_val >> 4) & 0x0F);
+    for (int k_base = 0; k_base < IF_vec; k_base += BLOCK_DIM_X) {
+        int k_vec = k_base + tx;
+        int base_k = k_vec * 16; // The actual starting column for this chunk
 
-        // Fetch scale and zero point
-        int group_idx = k / group_size;
-        float s_val = __half2float(S[current_of * (IF / group_size) + group_idx]);
-        float z_val = __half2float(Z[current_of * (IF / group_size) + group_idx]);
+        // ty=0 fetches 16 activations into shared memory
+        if (ty == 0 && k_vec < IF_vec) {
+            #pragma unroll
+            for(int i = 0; i < 16; i++) {
+                shm_act[tx * 16 + i] = __half2float(__ldg(&activations[base_k + i]));
+            }
+        }
+        __syncthreads();
 
-        // Dequantize the weight
-        float w_deq = (static_cast<float>(w_unpacked) - z_val) * s_val;
-        
-        // Read activation and accumulate
-        float act_val = __half2float(activations[k]);
-        
-        partial_acc += w_deq * act_val;
+        if (k_vec < IF_vec) {
+            // THE GULP: Fetch 128-bits (16 weights) in a single hardware instruction
+            uint4 w_chunk_128 = W_vec[current_of_packed * IF_vec + k_vec];
+            
+            // Break it down into four 32-bit registers for easy processing
+            uint32_t chunks[4] = {w_chunk_128.x, w_chunk_128.y, w_chunk_128.z, w_chunk_128.w};
+
+            // ==========================================================
+            // THE JACKPOT: Because we load 16 weights, and group_size is 16,
+            // this entire chunk shares exactly ONE Scale and ONE Zero-point!
+            // ==========================================================
+            int group_idx = base_k / group_size; 
+            float s_val = __half2float(__ldg(&S[row_idx * (IF / group_size) + group_idx]));
+            float z_val = __half2float(__ldg(&Z[row_idx * (IF / group_size) + group_idx]));
+
+            // Process all 16 weights in pure, blindingly fast register math
+            #pragma unroll
+            for(int c = 0; c < 4; c++) {
+                #pragma unroll
+                for(int step = 0; step < 4; step++) {
+                    uint8_t w_packed_val = (chunks[c] >> (step * 8)) & 0xFF;
+                    uint8_t w_unpacked = (ty == 0) ? (w_packed_val & 0x0F) : ((w_packed_val >> 4) & 0x0F);
+
+                    float w_deq = (static_cast<float>(w_unpacked) - z_val) * s_val;
+                    float act_val = shm_act[tx * 16 + (c * 4) + step];
+
+                    partial_acc += w_deq * act_val;
+                }
+            }
+        }
+        __syncthreads();
     }
 
-    // STEP 2: Warp-Level Reduction
-    // A warp is a group of 32 threads. They can share data directly without RAM.
+    // Warp Reduction
     for (int offset = 16; offset > 0; offset /= 2) {
         partial_acc += __shfl_down_sync(0xffffffff, partial_acc, offset);
     }
 
-    // STEP 3: Block-Level Reduction via Shared Memory
-    // We have 256 threads = 8 warps. We need to sum the 8 results from the warps.
-    __shared__ float shared_acc[32]; 
-    
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
+    // Block Reduction
+    __shared__ float shm_reduce[BLOCK_DIM_Y][2];
+    int warp_id = tx / 32;
+    int lane_id = tx % 32;
 
-    // The first thread in each warp writes its result to shared memory
     if (lane_id == 0) {
-        shared_acc[warp_id] = partial_acc;
+        shm_reduce[ty][warp_id] = partial_acc;
     }
-    
-    // Ensure all warps have written to shared memory before continuing
     __syncthreads();
 
-    // STEP 4: Final sum by the very first warp
-    if (warp_id == 0) {
-        // Read the 8 warp results (other threads read 0.0)
-        partial_acc = (lane_id < (blockDim.x / 32)) ? shared_acc[lane_id] : 0.0f;
-        
-        // Do one last reduction to get the final total in thread 0
-        for (int offset = 16; offset > 0; offset /= 2) {
-            partial_acc += __shfl_down_sync(0xffffffff, partial_acc, offset);
+    // Output
+    if (tx == 0) {
+        float final_acc = shm_reduce[ty][0] + shm_reduce[ty][1];
+        float bias_val = __half2float(b[row_idx]);
+        OUT[row_idx] = __float2half(final_acc + bias_val);
+    }
+}
+
+__global__ void w4a16_gemv_vectorized_kernel(
+    // restric says it does not overlap with nothing 
+    const uint8_t* __restrict__ W_packed, 
+    const half* __restrict__ b,
+    const half* __restrict__ S,           
+    const half* __restrict__ Z,           
+    const half* __restrict__ activations, 
+    half* __restrict__ OUT,               
+    int OF, int IF, int group_size) 
+{
+    // The thread from the thread block
+    int tx = threadIdx.x; 
+    int ty = threadIdx.y; 
+    int current_of_packed = blockIdx.x;
+    int row_idx = (current_of_packed * 2) + ty;
+
+    // we cast to 32bits in order to read more at once
+    const uint32_t* W_vec = reinterpret_cast<const uint32_t*>(W_packed);
+    
+    // we only need to loop 1/4 times now
+    int IF_vec = IF / 4; 
+
+    // we need 4 the shared memory
+    // shared is for all threads in the same thread block
+    __shared__ float shm_act[BLOCK_DIM_X * 4];
+
+    float partial_acc = 0.0f;
+
+    // Leap froging
+    for (int k_base = 0; k_base < IF_vec; k_base += BLOCK_DIM_X) {
+        int k_vec = k_base + tx;
+
+        // Fetch 4 activations sequentially and drop them in shared memory
+        if (ty == 0 && k_vec < IF_vec) {
+            int act_idx = k_vec * 4;
+            // __ldg forces the read through the Read-Only Texture Cache
+            shm_act[tx * 4 + 0] = __half2float(__ldg(&activations[act_idx + 0]));
+            shm_act[tx * 4 + 1] = __half2float(__ldg(&activations[act_idx + 1]));
+            shm_act[tx * 4 + 2] = __half2float(__ldg(&activations[act_idx + 2]));
+            shm_act[tx * 4 + 3] = __half2float(__ldg(&activations[act_idx + 3]));
         }
+        __syncthreads();
+
+        if (k_vec < IF_vec) {
+            uint32_t w_chunk = W_vec[current_of_packed * IF_vec + k_vec];
+
+            // unroll the loop in the compiler to process the 4 bytes instantly in registers
+            #pragma unroll
+
+            // We do the slow division once for the whole 4-byte chunk
+            // this division outside it crucial
+            int group_idx = (k_vec * 4) / group_size;
+            float s_val = __half2float(__ldg(&S[row_idx * (IF / group_size) + group_idx]));
+            float z_val = __half2float(__ldg(&Z[row_idx * (IF / group_size) + group_idx]));
+
+            for(int step = 0; step < 4; step++) {
+                
+                // grab the specific 8-bit byte we need right now
+                uint8_t w_packed_val = (w_chunk >> (step * 8)) & 0xFF;
+                // unpacking logic
+                uint8_t w_unpacked = (ty == 0) ? (w_packed_val & 0x0F) : ((w_packed_val >> 4) & 0x0F);
+
+                // int actual_k = k_vec * 4 + step;
+                // int group_idx = actual_k / group_size;
+
+                float w_deq = (static_cast<float>(w_unpacked) - z_val) * s_val;
+                float act_val = shm_act[tx * 4 + step];
+
+                partial_acc += w_deq * act_val;
+            }
+        }
+        // if one wrap over the same tx range is much faster than a wrap
+        // we the same tx range but with a different ty then it will read
+        // overwritten stuff
+        __syncthreads();
     }
 
-    // STEP 5: Thread 0 adds the bias and writes to Global Memory
-    if (tid == 0) {
-        float bias_val = __half2float(b[current_of]);
-        OUT[current_of] = __float2half(partial_acc + bias_val);
+    // all-reduce across a warp, 32 thread 
+    for (int offset = 16; offset > 0; offset /= 2) {
+        partial_acc += __shfl_down_sync(0xffffffff, partial_acc, offset);
+    }
+
+    // block reduction, we have two warps over the x-axis 64/32=2
+    __shared__ float shm_reduce[BLOCK_DIM_Y][2];
+    
+    int warp_id = tx / 32;
+    int lane_id = tx % 32;
+    
+    // we take the captian
+    if (lane_id == 0) {
+        shm_reduce[ty][warp_id] = partial_acc;
+    }
+    __syncthreads();
+
+    // captian
+    if (tx == 0) {
+        float final_acc = shm_reduce[ty][0] + shm_reduce[ty][1];
+        float bias_val = __half2float(b[row_idx]);
+        OUT[row_idx] = __float2half(final_acc + bias_val);
     }
 }
 
@@ -110,15 +231,17 @@ torch::Tensor w4a16_forward(
     int OF = OF_packed * 2;
     
     TORCH_CHECK(B == 1, "This optimized kernel strictly requires Batch Size B=1");
+    
+    // we divide by 4
+    TORCH_CHECK(IF % 4 == 0, "Input Features must be a multiple of 4 for 32-bit vectorization");
 
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(W_packed.device());
     auto OUT = torch::empty({OF, B}, options);
 
-    // Grid Setup: 1 Block per Output Feature. 256 Threads per Block.
-    int threads = 256; 
-    int blocks = OF;
+    dim3 threads(BLOCK_DIM_X, BLOCK_DIM_Y); 
+    dim3 blocks(OF_packed);
 
-    w4a16_gemv_optimized_kernel<<<blocks, threads>>>(
+    w4a16_gemv_vectorized_kernel<<<blocks, threads>>>(
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<half*>(b.data_ptr<at::Half>()),
         reinterpret_cast<half*>(S.data_ptr<at::Half>()),
