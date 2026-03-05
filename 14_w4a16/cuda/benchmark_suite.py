@@ -14,24 +14,21 @@ DEVICE = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
 # ==============================================================================
 # 1. Custom CUDA Extension (JIT Compilation)
 # ==============================================================================
-print("Compiling custom CUDA extension...")
+print("Loading custom CUDA extension...")
 w4a16_cuda_ext = load(
     name='w4a16_cuda_ext',
     sources=['w4a16_cuda.cu'],
     extra_cuda_cflags=['-O3', '--use_fast_math'], # Optimization flags
     verbose=True
 )
-print("Compilation complete!")
+print("CUDA Extension Loaded!")
 
 def raw_cuda_w4a16(W, b, S, Z, group_size, activations):
-    # The C++ code strictly requires contiguous memory
     W = W.contiguous()
     b = b.contiguous()
     S = S.contiguous()
     Z = Z.contiguous()
     activations = activations.contiguous()
-    
-    # Call the PyBind11 exposed function
     return w4a16_cuda_ext.forward(W, b, S, Z, activations, group_size)
 
 
@@ -161,7 +158,6 @@ def torch_w4a16(W, b, S, Z, group_size, activations):
 def test_w4a16(shapes: tuple, atol=1e-2, rtol=1e-1, device=DEVICE):
     torch.manual_seed(0)
     OF_actual, IF, B = shapes
-    assert B == 1, "Testing GEMV explicitly requires B=1"
     
     OF_packed = OF_actual // 2
     group_size = 16
@@ -201,14 +197,13 @@ def benchmark_w4a16(shapes: tuple, device=DEVICE):
     S = torch.ones((OF_actual, L), device=device, dtype=torch.float16).contiguous()
     Z = torch.zeros_like(S).contiguous()
     activations = torch.randn((IF, B), device=device, dtype=torch.float16).contiguous()
-
     W_ref_fp16 = torch.randn((OF_actual, IF), device=device, dtype=torch.float16).contiguous()
 
     quantiles = [0.5, 0.05, 0.95]
 
     # Benchmark Triton
     tri_ms, tri_min_ms, tri_max_ms = triton.testing.do_bench(
-        lambda: w4a16_gemv(W_packed, b, S, Z, group_size, activations),
+        lambda: w4a16(W_packed, b, S, Z, group_size, activations),
         quantiles=quantiles,
     )
 
@@ -239,15 +234,14 @@ def benchmark_w4a16(shapes: tuple, device=DEVICE):
     }
 
 if __name__ == "__main__":
-    # 1) Basic correctness check
     print("Running w4a16 correctness test...")
+    # NOTE: Your kernel handles B > 1 now, so you can test larger batch sizes!
     test_w4a16(shapes=(1024, 1024, 1), device=DEVICE)
 
-    # 2) Benchmark sweep
     print("\nRunning w4a16 benchmarks and generating plots...")
     OF_vals = [4096, 8192, 16384, 32768]
     IF = 8192
-    B = 1
+    B = 1 
     records = []
     
     for OF in OF_vals:
@@ -274,11 +268,10 @@ if __name__ == "__main__":
     df = pd.DataFrame.from_records(records)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_csv = f"w4a16_gemv_benchmark_{timestamp}.csv"
+    results_csv = f"w4a16_gemm_benchmark_{timestamp}.csv"
     df.to_csv(results_csv, index=False)
     print(f"\nSaved benchmark data to {results_csv}")
 
-    # Create a figure with two subplots side-by-side
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     plot_configs = [
@@ -287,25 +280,23 @@ if __name__ == "__main__":
         ("raw_cuda_w4a16", "Raw CUDA W4A16", "tab:green")
     ]
 
-    # Plot 1: TFLOPS vs OF
     for provider, label, color in plot_configs:
         sub = df[df["provider"] == provider]
         ax1.plot(sub["OF"], sub["tflops"], marker="o", label=label, color=color)
 
     ax1.set_xlabel("Output features (OF)")
     ax1.set_ylabel("TFLOPS (approximate)")
-    ax1.set_title("Throughput: W4A16 GEMV vs PyTorch FP16")
+    ax1.set_title(f"Throughput: W4A16 GEMM (B={B})")
     ax1.grid(True, alpha=0.3)
     ax1.legend()
 
-    # Plot 2: Execution Time (ms) vs OF
     for provider, label, color in plot_configs:
         sub = df[df["provider"] == provider]
         ax2.plot(sub["OF"], sub["ms"], marker="o", label=label, color=color)
 
     ax2.set_xlabel("Output features (OF)")
     ax2.set_ylabel("Execution Time (ms)")
-    ax2.set_title("Latency: W4A16 GEMV vs PyTorch FP16")
+    ax2.set_title(f"Latency: W4A16 GEMM (B={B})")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
 
