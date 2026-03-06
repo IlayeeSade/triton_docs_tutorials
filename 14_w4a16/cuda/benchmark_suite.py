@@ -7,20 +7,12 @@ import pandas as pd
 import os
 import numpy as np
 from datetime import datetime
+import w4a16_cuda_ext
+
+#
+import nsight
 
 DEVICE = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-
-# ==============================================================================
-# 1. Load Custom CUDA Extension
-# ==============================================================================
-print("Loading custom CUDA extension...")
-w4a16_cuda_ext = load(
-    name='w4a16_cuda_ext', 
-    sources=['w4a16_cuda.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math'], 
-    verbose=True
-)
-print("CUDA Extension Loaded!")
 
 def raw_cuda_w4a16(W, b, S, Z, group_size, activations):
     W = W.contiguous()
@@ -207,10 +199,8 @@ def benchmark_w4a16(shapes: tuple, device=DEVICE):
         'raw_cuda_w4a16': (cuda_ms, cuda_min_ms, cuda_max_ms),
     }
 
-if __name__ == "__main__":
-    print("Running w4a16 correctness test...")
-    test_w4a16(shapes=(1024, 1024, 1), device=DEVICE)
 
+def plotting_and_benchmarking():
     print("\nRunning w4a16 benchmarks and generating plots...")
     OF_vals = [4096, 8192, 16384, 32768]
     IF = 8192
@@ -276,3 +266,39 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(plot_path)
     print(f"Saved performance plots to {plot_path}")
+
+
+
+@nsight.analyze.plot("01_nsight_sweep.png")
+@nsight.analyze.kernel(
+    configs=[4096, 8192, 16384, 32768],
+    runs=2,
+)
+def run_nsight_benchmark_profiling(OF_actual):
+    # presets
+    IF = 8192
+    B = 1
+    device = DEVICE
+    group_size = 16
+
+    OF_packed = OF_actual // 2
+
+    W_packed = torch.randint(0, 256, (OF_packed, IF), device=device, dtype=torch.uint8).contiguous()
+    b = torch.randn((OF_actual,), device=device, dtype=torch.float16).contiguous()
+    
+    L = max(64, IF // group_size)
+    S = torch.ones((OF_actual, L), device=device, dtype=torch.float16).contiguous()
+    Z = torch.zeros_like(S).contiguous()
+    activations = torch.randn((IF, B), device=device, dtype=torch.float16).contiguous()
+
+    with nsight.annotate(f"w4a16_{OF_actual}"):
+        _ = raw_cuda_w4a16(W_packed, b, S, Z, group_size, activations)
+
+
+if __name__ == "__main__":
+    print("Running w4a16 correctness test...")
+    test_w4a16(shapes=(1024, 1024, 1), device=DEVICE)
+    
+    print("Running Nsight Profiling")
+    run_nsight_benchmark_profiling()
+    
