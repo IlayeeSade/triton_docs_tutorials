@@ -32,8 +32,8 @@ DEVICE = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
 # 2. Kernel Wrappers
 # ==============================================================================
 
-def raw_cuda_w4a16(W, b, S, Z, group_size, activations):
-    return w4a16_cuda_ext.forward(W.contiguous(), b.contiguous(), S.contiguous(), Z.contiguous(), activations.contiguous(), group_size)
+def raw_cuda_w4a16(W, b, SZ, group_size, activations):
+    return w4a16_cuda_ext.forward(W.contiguous(), b.contiguous(), SZ.contiguous(), activations.contiguous(), group_size)
 
 @triton.autotune(
     configs=[
@@ -119,14 +119,42 @@ def plotting_and_benchmarking():
         # --- Data for Triton / Raw CUDA / Torch (Your Layout) ---
         W_packed = torch.randint(0, 255, (OF // 2, IF), device=DEVICE, dtype=torch.uint8).contiguous()
         b = torch.randn((OF,), device=DEVICE, dtype=torch.float16).contiguous()
-        S = torch.ones((OF, IF // group_size), device=DEVICE, dtype=torch.float16).contiguous()
-        Z = torch.randint(0, 15, (OF, IF // group_size), device=DEVICE, dtype=torch.float16).contiguous()
+
+        G = IF // group_size
+
+        S = torch.ones((OF, G), device=DEVICE, dtype=torch.float16).contiguous()
+        Z = torch.randint(0, 15, (OF, G), device=DEVICE, dtype=torch.float16).contiguous()
+
+
+        def interleave_transposed_s_z(S: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+            assert S.shape == Z.shape
+            assert S.dtype == torch.float16 and Z.dtype == torch.float16
+            assert S.is_contiguous() and Z.is_contiguous()
+
+            # Transpose: [OF, G] -> [G, OF]
+            S_t = S.transpose(0, 1).contiguous()
+            Z_t = Z.transpose(0, 1).contiguous()
+
+            G, OF = S_t.shape
+
+            # Stack into [G, OF, 2], where last dim is [S, Z]
+            SZ = torch.stack((S_t, Z_t), dim=-1)
+
+            # Flatten last two dims: [G, OF, 2] -> [G, 2*OF]
+            # Row layout becomes: S_col0, Z_col0, S_col1, Z_col1, ...
+            SZ_interleaved = SZ.reshape(G, 2 * OF).contiguous()
+
+            return SZ_interleaved
+
+
+        SZ = interleave_transposed_s_z(S, Z)
+
         act = torch.randn((IF, B), device=DEVICE, dtype=torch.float16).contiguous()
         W_ref_fp16 = torch.randn((OF, IF), device=DEVICE, dtype=torch.float16).contiguous()
 
         # --- Correctness check: raw CUDA vs Torch reference ---
         torch_ref = torch_w4a16(W_packed, b, S, Z, group_size, act)
-        cuda_out = raw_cuda_w4a16(W_packed, b, S, Z, group_size, act)
+        cuda_out = raw_cuda_w4a16(W_packed, b, SZ, group_size, act)
 
         max_abs_err = (cuda_out - torch_ref).abs().max().item()
         mean_abs_err = (cuda_out - torch_ref).abs().mean().item()
@@ -163,7 +191,7 @@ def plotting_and_benchmarking():
         
         torch_ms = triton.testing.do_bench(lambda: torch.matmul(W_ref_fp16, act) + b[:, None], quantiles=quantiles)[0]
         tri_ms = triton.testing.do_bench(lambda: w4a16_gemv_triton(W_packed, b, S, Z, group_size, act), quantiles=quantiles)[0]
-        cuda_ms = triton.testing.do_bench(lambda: raw_cuda_w4a16(W_packed, b, S, Z, group_size, act), quantiles=quantiles)[0]
+        cuda_ms = triton.testing.do_bench(lambda: raw_cuda_w4a16(W_packed, b, SZ, group_size, act), quantiles=quantiles)[0]
         
         try:
             awq_ms = triton.testing.do_bench(lambda: awq_cuda_ext.forward(act_awq, W_awq, Z_awq, S_awq, IF, OF, group_size), quantiles=quantiles)[0]

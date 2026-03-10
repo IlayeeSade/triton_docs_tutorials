@@ -12,8 +12,7 @@
 __global__ void w4a16_gemv_vectorized_kernel(
     const uint8_t* __restrict__ W_packed, 
     const half* __restrict__ b,
-    const half* __restrict__ S,           
-    const half* __restrict__ Z,           
+    const half* __restrict__ SZ,                    
     const half* __restrict__ activations, 
     half* __restrict__ OUT,               
     int OF, int IF, int group_size) 
@@ -58,11 +57,16 @@ __global__ void w4a16_gemv_vectorized_kernel(
             // notice we need to grab 16 bits for every activation so ideally we want 128 / 16 = 8 groups per thread
             // Maybe we could use some other compression which prepares scaling and zeros for the next turns
             // TODO 
-            float s_val_0 = __half2float(__ldg(&S[row_idx * (IF / group_size) + group_idx]));
-            float s_val_1 = __half2float(__ldg(&S[(row_idx + 1) * (IF / group_size) + group_idx]));
-            // uint32_t z_intermediate_ptrs = *(Z + row_idx * (IF / group_size / 8) + group_idx);
-            float z_val_0 = __half2float(__ldg(&Z[row_idx * (IF / group_size) + group_idx]));
-            float z_val_1 = __half2float(__ldg(&Z[(row_idx + 1) * (IF / group_size) + group_idx]));
+            int G = IF / group_size;
+            int base_half = group_idx * (2 * OF) + 2 * row_idx;
+
+            const uint2 packed = reinterpret_cast<const uint2*>(SZ)[base_half >> 2];
+            const half* vals = reinterpret_cast<const half*>(&packed);
+
+            float s_val_0 = __half2float(vals[0]);
+            float z_val_0 = __half2float(vals[1]);
+            float s_val_1 = __half2float(vals[2]);
+            float z_val_1 = __half2float(vals[3]);
 
             #pragma unroll
             for(int step = 0; step < 4; step++) {
@@ -140,21 +144,71 @@ __global__ void w4a16_gemv_vectorized_kernel(
 torch::Tensor w4a16_forward(
     torch::Tensor W_packed, 
     torch::Tensor b, 
-    torch::Tensor S, 
-    torch::Tensor Z, 
+    torch::Tensor SZ, 
     torch::Tensor activations, 
     int group_size) 
 {
-    TORCH_CHECK(W_packed.is_cuda() && W_packed.is_contiguous(), "W_packed must be CUDA & contiguous");
-    TORCH_CHECK(activations.is_cuda() && activations.is_contiguous(), "activations must be CUDA & contiguous");
-    
-    int OF_packed = W_packed.size(0);
-    int IF = W_packed.size(1);
-    int B = activations.size(1);
-    int OF = OF_packed * 2;
-    
+    TORCH_CHECK(W_packed.is_cuda(), "W_packed must be a CUDA tensor");
+    TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
+    TORCH_CHECK(SZ.is_cuda(), "SZ must be a CUDA tensor");
+    TORCH_CHECK(activations.is_cuda(), "activations must be a CUDA tensor");
+
+    TORCH_CHECK(W_packed.is_contiguous(), "W_packed must be contiguous");
+    TORCH_CHECK(b.is_contiguous(), "b must be contiguous");
+    TORCH_CHECK(SZ.is_contiguous(), "SZ must be contiguous");
+    TORCH_CHECK(activations.is_contiguous(), "activations must be contiguous");
+
+    TORCH_CHECK(W_packed.scalar_type() == torch::kUInt8, "W_packed must have dtype torch.uint8");
+    TORCH_CHECK(b.scalar_type() == torch::kFloat16, "b must have dtype torch.float16");
+    TORCH_CHECK(SZ.scalar_type() == torch::kFloat16, "SZ must have dtype torch.float16");
+    TORCH_CHECK(activations.scalar_type() == torch::kFloat16, "activations must have dtype torch.float16");
+
+    TORCH_CHECK(W_packed.device() == b.device(), "W_packed and b must be on the same CUDA device");
+    TORCH_CHECK(W_packed.device() == SZ.device(), "W_packed and SZ must be on the same CUDA device");
+    TORCH_CHECK(W_packed.device() == activations.device(), "W_packed and activations must be on the same CUDA device");
+
+    TORCH_CHECK(W_packed.dim() == 2, "W_packed must be a 2D tensor of shape [OF_packed, IF]");
+    TORCH_CHECK(activations.dim() == 2, "activations must be a 2D tensor of shape [IF, B]");
+    TORCH_CHECK(b.dim() == 1 || (b.dim() == 2 && b.size(1) == 1),
+                "b must be a 1D tensor of shape [OF] or a 2D tensor of shape [OF, 1]");
+    TORCH_CHECK(SZ.dim() == 2, "SZ must be a 2D tensor of shape [IF / group_size, 2 * OF]");
+
+    TORCH_CHECK(group_size > 0, "group_size must be > 0");
+
+    int64_t OF_packed = W_packed.size(0);
+    int64_t IF = W_packed.size(1);
+    int64_t B = activations.size(1);
+    int64_t OF = OF_packed * 2;
+
+    TORCH_CHECK(OF_packed > 0, "W_packed.size(0) must be > 0");
+    TORCH_CHECK(IF > 0, "W_packed.size(1) must be > 0");
+
     TORCH_CHECK(B == 1, "This optimized kernel strictly requires Batch Size B=1");
     TORCH_CHECK(IF % 4 == 0, "Input Features must be a multiple of 4 for 32-bit vectorization");
+    TORCH_CHECK(IF % group_size == 0, "Input Features must be divisible by group_size");
+
+    TORCH_CHECK(activations.size(0) == IF,
+                "activations.size(0) must match W_packed.size(1). Got activations.size(0)=",
+                activations.size(0), " and W_packed.size(1)=", IF);
+
+    const int64_t G = IF / group_size;
+
+    TORCH_CHECK(
+        (b.dim() == 1 && b.size(0) == OF) || (b.dim() == 2 && b.size(0) == OF && b.size(1) == 1),
+        "b must contain exactly OF elements. Expected shape [", OF, "] or [", OF, ", 1], got ",
+        b.sizes()
+    );
+
+    TORCH_CHECK(SZ.size(0) == G,
+                "SZ.size(0) must equal IF / group_size. Expected ", G, ", got ", SZ.size(0));
+    TORCH_CHECK(SZ.size(1) == 2 * OF,
+                "SZ.size(1) must equal 2 * OF. Expected ", 2 * OF, ", got ", SZ.size(1));
+
+    TORCH_CHECK((2 * OF) % 4 == 0,
+                "2 * OF must be divisible by 4 for uint2-based SZ loads. Got OF=", OF);
+    TORCH_CHECK(SZ.numel() == G * 2 * OF,
+                "SZ must have exactly G * 2 * OF elements. Expected ", (G * 2 * OF),
+                ", got ", SZ.numel());
 
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(W_packed.device());
     auto OUT = torch::empty({OF, B}, options);
@@ -165,11 +219,10 @@ torch::Tensor w4a16_forward(
     w4a16_gemv_vectorized_kernel<<<blocks, threads>>>(
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<half*>(b.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(S.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(Z.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(SZ.data_ptr<at::Half>()),
         reinterpret_cast<half*>(activations.data_ptr<at::Half>()),
         reinterpret_cast<half*>(OUT.data_ptr<at::Half>()),
-        OF, IF, group_size
+        static_cast<int>(OF), static_cast<int>(IF), group_size
     );
 
     cudaError_t err = cudaGetLastError();
