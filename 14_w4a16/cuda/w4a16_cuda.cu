@@ -26,25 +26,21 @@ __global__ void w4a16_gemv_vectorized_kernel(
     const uint32_t* W_vec = reinterpret_cast<const uint32_t*>(W_packed);
     int IF_vec = IF / 4; 
 
-    // Main data shared memory
-    __shared__ float shm_act[BLOCK_DIM_X * 4];
-
     float partial_acc = 0.0f;
 
     for (int k_base = 0; k_base < IF_vec; k_base += BLOCK_DIM_X) {
         int k_vec = k_base + tx;
 
-        // Fetch 4 activations
-        if (ty == 0 && k_vec < IF_vec) {
-            int act_idx = k_vec * 4;
-            shm_act[tx * 4 + 0] = __half2float(__ldg(&activations[act_idx + 0]));
-            shm_act[tx * 4 + 1] = __half2float(__ldg(&activations[act_idx + 1]));
-            shm_act[tx * 4 + 2] = __half2float(__ldg(&activations[act_idx + 2]));
-            shm_act[tx * 4 + 3] = __half2float(__ldg(&activations[act_idx + 3]));
-        }
-        __syncthreads();
-
         if (k_vec < IF_vec) {
+            // Fetch 4 activations directly into registers. 
+            // The hardware L1 cache will automatically broadcast to threads sharing the same act_idx.
+            int act_idx = k_vec * 4;
+            float local_act[4];
+            local_act[0] = __half2float(__ldg(&activations[act_idx + 0]));
+            local_act[1] = __half2float(__ldg(&activations[act_idx + 1]));
+            local_act[2] = __half2float(__ldg(&activations[act_idx + 2]));
+            local_act[3] = __half2float(__ldg(&activations[act_idx + 3]));
+
             uint32_t w_chunk = W_vec[current_of_packed * IF_vec + k_vec];
 
             int group_idx = (k_vec * 4) / group_size / 8; // Calculate group index for scaling factors and zeros
@@ -58,12 +54,11 @@ __global__ void w4a16_gemv_vectorized_kernel(
                 uint8_t w_unpacked = (ty == 0) ? (w_packed_val & 0x0F) : ((w_packed_val >> 4) & 0x0F);
 
                 float w_deq = (static_cast<float>(w_unpacked) - z_val) * s_val;
-                float act_val = shm_act[tx * 4 + step];
+                float act_val = local_act[step];
 
                 partial_acc += w_deq * act_val;
             }
         }
-        __syncthreads();
     }
 
     // --- REDUCTION STAGE ---
