@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#define BLOCK_DIM_X 128
+#define BLOCK_DIM_X 32
 #define BLOCK_DIM_Y 2
 
 // ---------------------------------------------------------
@@ -44,6 +44,11 @@ __global__ void w4a16_gemv_vectorized_kernel(
             uint32_t w_chunk = W_vec[current_of_packed * IF_vec + k_vec];
 
             int group_idx = (k_vec * 4) / group_size / 8; // Calculate group index for scaling factors and zeros
+
+            // grabbing 16 bit two byte float, even though the bus is 128 bit.
+            // : float s_val = __half2float(__ldg(&S[row_idx * (IF / group_size) + group_idx])) :
+            // notice we need to grab 16 bits for every activation so ideally we want 128 / 16 = 8 groups per thread
+            // That is not so plausible.
             float s_val = __half2float(__ldg(&S[row_idx * (IF / group_size) + group_idx]));
             // uint32_t z_intermediate_ptrs = *(Z + row_idx * (IF / group_size / 8) + group_idx);
             float z_val = __half2float(__ldg(&Z[row_idx * (IF / group_size) + group_idx]));
@@ -69,30 +74,32 @@ __global__ void w4a16_gemv_vectorized_kernel(
         partial_acc += __shfl_down_sync(0xffffffff, partial_acc, offset);
     }
 
-    // 2. Shared memory for Cross-warp reduction
-    // Size is dynamically calculated based on warps per block
-    constexpr int NUM_WARPS = BLOCK_DIM_X / 32;
-    __shared__ float shm_reduce[BLOCK_DIM_Y][NUM_WARPS];
+    // *** cross warp reduction would go here if we had more than 32 threads per block *** //
+    // // 2. Shared memory for Cross-warp reduction
+    // // Size is dynamically calculated based on warps per block
+    // constexpr int NUM_WARPS = BLOCK_DIM_X / 32;
+    // __shared__ float shm_reduce[BLOCK_DIM_Y][NUM_WARPS];
     
-    int warp_id = tx / 32;
-    int lane_id = tx % 32;
+    // int warp_id = tx / 32;
+    // int lane_id = tx % 32;
     
-    if (lane_id == 0) {
-        shm_reduce[ty][warp_id] = partial_acc;
-    }
-    __syncthreads();
+    // if (lane_id == 0) {
+    //     shm_reduce[ty][warp_id] = partial_acc;
+    // }
+    // __syncthreads();
 
     // 3. Final Block-level reduction (Inter-warp)
     if (tx == 0) {
-        float final_acc = 0.0f;
-        
-        #pragma unroll
-        for (int i = 0; i < NUM_WARPS; i++) {
-            final_acc += shm_reduce[ty][i];
-        }
 
+        // ** cross warp ** //
+        // float partial_acc = 0.0f;
+        
+        // #pragma unroll
+        // for (int i = 0; i < NUM_WARPS; i++) {
+        //     partial_acc += shm_reduce[ty][i];
+        // }
         float bias_val = __half2float(b[row_idx]);
-        OUT[row_idx] = __float2half(final_acc + bias_val);
+        OUT[row_idx] = __float2half(partial_acc + bias_val);
     }
 }
 

@@ -120,12 +120,23 @@ def plotting_and_benchmarking():
         W_packed = torch.randint(0, 255, (OF // 2, IF), device=DEVICE, dtype=torch.uint8).contiguous()
         b = torch.randn((OF,), device=DEVICE, dtype=torch.float16).contiguous()
         S = torch.ones((OF, IF // group_size), device=DEVICE, dtype=torch.float16).contiguous()
-        
-        # Initialize Z as float16 with integer-like values (0-15) so it compresses cleanly
         Z = torch.randint(0, 15, (OF, IF // group_size), device=DEVICE, dtype=torch.float16).contiguous()
         act = torch.randn((IF, B), device=DEVICE, dtype=torch.float16).contiguous()
         W_ref_fp16 = torch.randn((OF, IF), device=DEVICE, dtype=torch.float16).contiguous()
 
+        # --- Correctness check: raw CUDA vs Torch reference ---
+        torch_ref = torch_w4a16(W_packed, b, S, Z, group_size, act)
+        cuda_out = raw_cuda_w4a16(W_packed, b, S, Z, group_size, act)
+
+        max_abs_err = (cuda_out - torch_ref).abs().max().item()
+        mean_abs_err = (cuda_out - torch_ref).abs().mean().item()
+
+        print(f"raw_cuda vs torch | max abs err = {max_abs_err:.6f}, mean abs err = {mean_abs_err:.6f}")
+
+        assert torch.allclose(cuda_out, torch_ref, atol=1e-2, rtol=1e-2), (
+            f"raw_cuda correctness check failed for OF={OF}: "
+            f"max_abs_err={max_abs_err:.6f}, mean_abs_err={mean_abs_err:.6f}"
+        )
         # --- Data for AWQ (Corrected Layout & Types) ---
         
         # 1. W_awq: Must be uint8 to pass PyTorch checks, but must allocate enough bytes 
