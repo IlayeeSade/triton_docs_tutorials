@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 
 #define BLOCK_DIM_X 32
-#define BLOCK_DIM_Y 4
+#define BLOCK_DIM_Y 2
 
 // ---------------------------------------------------------
 // 1. The VECTORIZED Shared Weight Broadcast Kernel
