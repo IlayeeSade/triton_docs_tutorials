@@ -109,7 +109,7 @@ def plotting_and_benchmarking():
     OF_vals = [4096, 8192, 16384, 32768]
     IF = 8192
     B = 1
-    group_size = 256
+    group_size = 128
     PACK_FACTOR = 8
     records = []
 

@@ -10,3 +10,4 @@
 10. Coalecsing.
 11. Software-pipelining.
 12. ILP
+13. General Hard-code or replace hard operations.
