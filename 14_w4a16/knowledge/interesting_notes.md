@@ -7,3 +7,6 @@
 7. Reusing as much as you can, but also consider structual requirements and utilizing them for the compression mechanism and method in general.
 8. Banks, 32 banks for warp, notice the access different banks (Leap-frogging)
 9. Leap-Frogging.
+10. Coalecsing.
+11. Software-pipelining.
+12. ILP
