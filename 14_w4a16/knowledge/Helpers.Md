@@ -71,3 +71,5 @@ Global Memory (DRAM)
 # Achieved Occupancy
 
 Achieved occupancy might be lower than theoretical because it counts activate number of warps which are not stalled. This practically means that warp stall causes discrepencies.
+
+Branching is pretty cheap.

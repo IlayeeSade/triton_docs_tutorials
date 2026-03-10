@@ -68,13 +68,37 @@ b = torch.randn(OF_packed * 2, dtype=torch.float16, device="cuda")
 S = torch.ones((OF_packed * 2, IF // group_size), dtype=torch.float16, device="cuda")
 Z = torch.zeros((OF_packed * 2, IF // group_size), dtype=torch.float16, device="cuda")
 
+
+def interleave_transposed_s_z(S: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+    assert S.shape == Z.shape
+    assert S.dtype == torch.float16 and Z.dtype == torch.float16
+    assert S.is_contiguous() and Z.is_contiguous()
+
+    # Transpose: [OF, G] -> [G, OF]
+    S_t = S.transpose(0, 1).contiguous()
+    Z_t = Z.transpose(0, 1).contiguous()
+
+    G, OF = S_t.shape
+
+    # Stack into [G, OF, 2], where last dim is [S, Z]
+    SZ = torch.stack((S_t, Z_t), dim=-1)
+
+    # Flatten last two dims: [G, OF, 2] -> [G, 2*OF]
+    # Row layout becomes: S_col0, Z_col0, S_col1, Z_col1, ...
+    SZ_interleaved = SZ.reshape(G, 2 * OF).contiguous()
+
+    return SZ_interleaved
+
+
+SZ = interleave_transposed_s_z(S, Z)
+
 # 4. Warm-up
 for _ in range(10):
-    _ = w4a16_cuda_ext.forward(W_packed, b, S, Z, activations, group_size)
+    _ = w4a16_cuda_ext.forward(W_packed, b, SZ, activations, group_size)
 torch.cuda.synchronize()
 
 # 5. Profiled Run
-out = w4a16_cuda_ext.forward(W_packed, b, S, Z, activations, group_size)
+out = w4a16_cuda_ext.forward(W_packed, b, SZ, activations, group_size)
 torch.cuda.synchronize()
 
 print("Kernel executed successfully. Output shape:", out.shape)
