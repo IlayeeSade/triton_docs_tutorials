@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 
 #define BLOCK_DIM_X 32
-#define BLOCK_DIM_Y 4
+#define BLOCK_DIM_Y 8
 
 // ---------------------------------------------------------
 // 1. The VECTORIZED Shared Weight Broadcast Kernel
@@ -269,21 +269,14 @@ __global__ void w4a16_gemv_vectorized_kernel(
 
         if (lane_id == 0) {
             if (row_idx + 3 < OF) {
-
-                half out_vals[4];
                 const uint2 bias_pack = __ldg(reinterpret_cast<const uint2*>(&b[row_idx]));
                 const half* bias_h = reinterpret_cast<const half*>(&bias_pack);
 
+                half out_vals[4];
                 out_vals[0] = __float2half_rn(block_acc_0 + __half2float(bias_h[0]));
                 out_vals[1] = __float2half_rn(block_acc_1 + __half2float(bias_h[1]));
                 out_vals[2] = __float2half_rn(block_acc_2 + __half2float(bias_h[2]));
                 out_vals[3] = __float2half_rn(block_acc_3 + __half2float(bias_h[3]));
-                
-                // // Without Bias
-                // out_vals[0] = __float2half_rn(block_acc_0);
-                // out_vals[1] = __float2half_rn(block_acc_1);
-                // out_vals[2] = __float2half_rn(block_acc_2);
-                // out_vals[3] = __float2half_rn(block_acc_3);  
 
                 *reinterpret_cast<uint2*>(&OUT[row_idx]) =
                     *reinterpret_cast<const uint2*>(out_vals);

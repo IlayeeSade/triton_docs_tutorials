@@ -3,14 +3,15 @@
 #include <cuda_runtime.h>
 
 #define BLOCK_DIM_X 32
-#define BLOCK_DIM_Y 4
+#define BLOCK_DIM_Y 8
 
 // ---------------------------------------------------------
 // 1. The VECTORIZED Shared Weight Broadcast Kernel
 //    Each threadblock-y lane handles 1 packed row = 4 output rows
 //    Each thread processes 8 input features at once
-//    For group_size = 64, SZ must be refreshed every quarter:
-//    steps [0..1], [2..3], [4..5], [6..7]
+//    For group_size = 128, SZ is refreshed only twice:
+//    half 0: steps [0..3]
+//    half 1: steps [4..7]
 //
 //    W_packed layout:
 //      shape = [OF / 4, IF]
@@ -34,7 +35,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
 
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_TX = BLOCK_DIM_X / WARP_SIZE;
-    constexpr int GROUP_SHIFT = 6; // log2(64)
+    constexpr int GROUP_SHIFT = 7; // log2(128)
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -81,7 +82,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
             const uint16_t* w16 = reinterpret_cast<const uint16_t*>(&w_chunk);
 
             // ---------------------------------------------------------
-            // Quarter 0: steps 0..1
+            // Half 0: steps 0..3
             // ---------------------------------------------------------
             {
                 int feature_idx = (k_vec << 3) + 0;
@@ -102,8 +103,13 @@ __global__ void w4a16_gemv_vectorized_kernel(
                 float z_val_3 = __half2float(vals[7]);
 
                 #pragma unroll
-                for (int step = 0; step < 2; step++) {
-                    float act_val = (step == 0) ? act0 : act1;
+                for (int step = 0; step < 4; step++) {
+                    float act_val;
+                    if (step == 0)      act_val = act0;
+                    else if (step == 1) act_val = act1;
+                    else if (step == 2) act_val = act2;
+                    else                act_val = act3;
+
                     uint16_t w_packed_val = w16[step];
 
                     uint8_t w0 = (w_packed_val >>  0) & 0x0F;
@@ -119,45 +125,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
             }
 
             // ---------------------------------------------------------
-            // Quarter 1: steps 2..3
-            // ---------------------------------------------------------
-            {
-                int feature_idx = (k_vec << 3) + 2;
-                int group_idx = feature_idx >> GROUP_SHIFT;
-
-                int base_half = group_idx * (2 * OF) + 2 * row_idx;
-                const uint4 packed_sz =
-                    reinterpret_cast<const uint4*>(SZ)[base_half >> 3];
-                const half* vals = reinterpret_cast<const half*>(&packed_sz);
-
-                float s_val_0 = __half2float(vals[0]);
-                float z_val_0 = __half2float(vals[1]);
-                float s_val_1 = __half2float(vals[2]);
-                float z_val_1 = __half2float(vals[3]);
-                float s_val_2 = __half2float(vals[4]);
-                float z_val_2 = __half2float(vals[5]);
-                float s_val_3 = __half2float(vals[6]);
-                float z_val_3 = __half2float(vals[7]);
-
-                #pragma unroll
-                for (int step = 2; step < 4; step++) {
-                    float act_val = (step == 2) ? act2 : act3;
-                    uint16_t w_packed_val = w16[step];
-
-                    uint8_t w0 = (w_packed_val >>  0) & 0x0F;
-                    uint8_t w1 = (w_packed_val >>  4) & 0x0F;
-                    uint8_t w2 = (w_packed_val >>  8) & 0x0F;
-                    uint8_t w3 = (w_packed_val >> 12) & 0x0F;
-
-                    partial_acc_0 += (static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
-                    partial_acc_1 += (static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
-                    partial_acc_2 += (static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
-                    partial_acc_3 += (static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
-                }
-            }
-
-            // ---------------------------------------------------------
-            // Quarter 2: steps 4..5
+            // Half 1: steps 4..7
             // ---------------------------------------------------------
             {
                 int feature_idx = (k_vec << 3) + 4;
@@ -178,46 +146,13 @@ __global__ void w4a16_gemv_vectorized_kernel(
                 float z_val_3 = __half2float(vals[7]);
 
                 #pragma unroll
-                for (int step = 4; step < 6; step++) {
-                    float act_val = (step == 4) ? act4 : act5;
-                    uint16_t w_packed_val = w16[step];
+                for (int step = 4; step < 8; step++) {
+                    float act_val;
+                    if (step == 4)      act_val = act4;
+                    else if (step == 5) act_val = act5;
+                    else if (step == 6) act_val = act6;
+                    else                act_val = act7;
 
-                    uint8_t w0 = (w_packed_val >>  0) & 0x0F;
-                    uint8_t w1 = (w_packed_val >>  4) & 0x0F;
-                    uint8_t w2 = (w_packed_val >>  8) & 0x0F;
-                    uint8_t w3 = (w_packed_val >> 12) & 0x0F;
-
-                    partial_acc_0 += (static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
-                    partial_acc_1 += (static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
-                    partial_acc_2 += (static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
-                    partial_acc_3 += (static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
-                }
-            }
-
-            // ---------------------------------------------------------
-            // Quarter 3: steps 6..7
-            // ---------------------------------------------------------
-            {
-                int feature_idx = (k_vec << 3) + 6;
-                int group_idx = feature_idx >> GROUP_SHIFT;
-
-                int base_half = group_idx * (2 * OF) + 2 * row_idx;
-                const uint4 packed_sz =
-                    reinterpret_cast<const uint4*>(SZ)[base_half >> 3];
-                const half* vals = reinterpret_cast<const half*>(&packed_sz);
-
-                float s_val_0 = __half2float(vals[0]);
-                float z_val_0 = __half2float(vals[1]);
-                float s_val_1 = __half2float(vals[2]);
-                float z_val_1 = __half2float(vals[3]);
-                float s_val_2 = __half2float(vals[4]);
-                float z_val_2 = __half2float(vals[5]);
-                float s_val_3 = __half2float(vals[6]);
-                float z_val_3 = __half2float(vals[7]);
-
-                #pragma unroll
-                for (int step = 6; step < 8; step++) {
-                    float act_val = (step == 6) ? act6 : act7;
                     uint16_t w_packed_val = w16[step];
 
                     uint8_t w0 = (w_packed_val >>  0) & 0x0F;
@@ -269,21 +204,14 @@ __global__ void w4a16_gemv_vectorized_kernel(
 
         if (lane_id == 0) {
             if (row_idx + 3 < OF) {
-
-                half out_vals[4];
                 const uint2 bias_pack = __ldg(reinterpret_cast<const uint2*>(&b[row_idx]));
                 const half* bias_h = reinterpret_cast<const half*>(&bias_pack);
 
+                half out_vals[4];
                 out_vals[0] = __float2half_rn(block_acc_0 + __half2float(bias_h[0]));
                 out_vals[1] = __float2half_rn(block_acc_1 + __half2float(bias_h[1]));
                 out_vals[2] = __float2half_rn(block_acc_2 + __half2float(bias_h[2]));
                 out_vals[3] = __float2half_rn(block_acc_3 + __half2float(bias_h[3]));
-                
-                // // Without Bias
-                // out_vals[0] = __float2half_rn(block_acc_0);
-                // out_vals[1] = __float2half_rn(block_acc_1);
-                // out_vals[2] = __float2half_rn(block_acc_2);
-                // out_vals[3] = __float2half_rn(block_acc_3);  
 
                 *reinterpret_cast<uint2*>(&OUT[row_idx]) =
                     *reinterpret_cast<const uint2*>(out_vals);
@@ -339,8 +267,8 @@ torch::Tensor w4a16_forward(
                 "SZ must be a 2D tensor of shape [IF / group_size, 2 * OF]");
 
     TORCH_CHECK(group_size > 0, "group_size must be > 0");
-    TORCH_CHECK(group_size == 64,
-                "This optimized kernel currently requires group_size == 64");
+    TORCH_CHECK(group_size == 128,
+                "This optimized kernel currently requires group_size == 128");
 
     int64_t OF_packed = W_packed.size(0); // OF / 4
     int64_t IF = W_packed.size(1);
