@@ -31,7 +31,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 # 5. Activate the Python Virtual Environment
 
 ```
-..venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 ```
 
 # 6. Verify the Compiler Exists

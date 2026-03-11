@@ -59,7 +59,7 @@ print("Compilation finished!")
 B = 1
 IF = 4096
 OF_packed = 4096 // 2
-group_size = 128
+group_size = 256
 
 # 3. Create dummy tensors on the GPU
 W_packed = torch.randint(0, 255, (OF_packed, IF // 4), dtype=torch.uint8, device="cuda")

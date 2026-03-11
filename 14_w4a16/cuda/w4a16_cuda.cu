@@ -9,6 +9,11 @@
 // 1. The VECTORIZED Shared Weight Broadcast Kernel
 //    Each threadblock-y lane still handles 2 packed rows = 4 output rows
 //    But each thread now processes 8 input features at once
+//
+//    Optimization added here:
+//    - Activations are still loaded directly from global memory per thread
+//    - SZ is now loaded once per ty into shared memory, because for a fixed
+//      k_base iteration all tx lanes use the same group_idx
 // ---------------------------------------------------------
 __global__ void w4a16_gemv_vectorized_kernel(
     const uint8_t* __restrict__ W_packed,
@@ -28,7 +33,9 @@ __global__ void w4a16_gemv_vectorized_kernel(
     int row_idx = current_of_packed_0 * 2; // first of 4 output rows
 
     const int OF_packed = OF >> 1;
-    if (current_of_packed_0 >= OF_packed) return;
+
+    // We cannot early-return anymore because we use __syncthreads()
+    bool valid_rows = (current_of_packed_0 < OF_packed);
 
     // Now each chunk is 64 bits = 8 bytes = 8 input features per packed row
     const uint64_t* W_vec = reinterpret_cast<const uint64_t*>(W_packed);
@@ -39,10 +46,26 @@ __global__ void w4a16_gemv_vectorized_kernel(
     float partial_acc_2 = 0.0f; // row_idx + 2
     float partial_acc_3 = 0.0f; // row_idx + 3
 
+    // Shared SZ: one uint4 per ty lane
+    __shared__ uint4 sh_sz[BLOCK_DIM_Y];
+
     for (int k_base = 0; k_base < IF_vec; k_base += BLOCK_DIM_X) {
         int k_vec = k_base + tx;
 
-        if (k_vec < IF_vec) {
+        // Each warp-step covers 32 * 8 = 256 features
+        // Therefore for a fixed k_base iteration, group_idx is identical across tx
+        constexpr int GROUP_SHIFT = 8; // log2(256)
+
+        // Load [s0,z0,s1,z1,s2,z2,s3,z3] for 4 rows once per ty
+        if (tx == 0 && valid_rows) {
+            int group_idx = (k_base * 8) >> GROUP_SHIFT;
+            int base_half = group_idx * (2 * OF) + 2 * row_idx;
+            sh_sz[ty] = reinterpret_cast<const uint4*>(SZ)[base_half >> 3];
+        }
+
+        __syncthreads();
+
+        if (k_vec < IF_vec && valid_rows) {
             // Load 8 activations = 128 bits
             int act_idx = k_vec * 8;
             uint4 packed_acts =
@@ -62,15 +85,8 @@ __global__ void w4a16_gemv_vectorized_kernel(
             uint64_t w_chunk_0 = W_vec[current_of_packed_0 * IF_vec + k_vec];
             uint64_t w_chunk_1 = W_vec[current_of_packed_1 * IF_vec + k_vec];
 
-            // Each warp-step covers 32 * 8 = 256 features
-            constexpr int GROUP_SHIFT = 8; // log2(256)
-            int group_idx = (k_vec * 8) >> GROUP_SHIFT;
-
-            // Load [s0,z0,s1,z1,s2,z2,s3,z3] for 4 rows
-            int base_half = group_idx * (2 * OF) + 2 * row_idx;
-            const uint4 packed_sz =
-                reinterpret_cast<const uint4*>(SZ)[base_half >> 3];
-            const half* vals = reinterpret_cast<const half*>(&packed_sz);
+            // Read shared [s0,z0,s1,z1,s2,z2,s3,z3] for 4 rows
+            const half* vals = reinterpret_cast<const half*>(&sh_sz[ty]);
 
             float s_val_0 = __half2float(vals[0]);
             float z_val_0 = __half2float(vals[1]);
@@ -115,6 +131,8 @@ __global__ void w4a16_gemv_vectorized_kernel(
                 partial_acc_3 += w_deq_3 * act_val;
             }
         }
+
+        __syncthreads();
     }
 
     // --- REDUCTION STAGE ---
@@ -127,7 +145,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
         partial_acc_3 += __shfl_down_sync(0xffffffff, partial_acc_3, offset);
     }
 
-    if (tx == 0) {
+    if (tx == 0 && valid_rows) {
         if (row_idx + 3 < OF) {
             const uint2 bias_pack = __ldg(reinterpret_cast<const uint2*>(&b[row_idx]));
             const half* bias_h = reinterpret_cast<const half*>(&bias_pack);
