@@ -7,8 +7,7 @@
 
 // ---------------------------------------------------------
 // 1. The VECTORIZED Shared Weight Broadcast Kernel
-//    Each threadblock-y lane still handles 2 packed rows = 4 output rows
-//    But each thread now processes 8 input features at once
+//    Each threadblock-y lane now handles 2 packed rows = 4 output rows
 // ---------------------------------------------------------
 __global__ void w4a16_gemv_vectorized_kernel(
     const uint8_t* __restrict__ W_packed,
@@ -21,7 +20,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    // Still 2 packed rows = 4 real rows
+    // Each ty now processes 2 packed rows = 4 output rows
     int packed_pair_idx = blockIdx.x * BLOCK_DIM_Y + ty;
     int current_of_packed_0 = packed_pair_idx * 2;
     int current_of_packed_1 = current_of_packed_0 + 1;
@@ -30,41 +29,47 @@ __global__ void w4a16_gemv_vectorized_kernel(
     const int OF_packed = OF >> 1;
     if (current_of_packed_0 >= OF_packed) return;
 
-    // Now each chunk is 64 bits = 8 bytes = 8 input features per packed row
-    const uint64_t* W_vec = reinterpret_cast<const uint64_t*>(W_packed);
-    int IF_vec = IF >> 3; // IF / 8
+    const uint32_t* W_vec = reinterpret_cast<const uint32_t*>(W_packed);
+    int IF_vec = IF >> 2;
 
     float partial_acc_0 = 0.0f; // row_idx + 0
     float partial_acc_1 = 0.0f; // row_idx + 1
-    float partial_acc_2 = 0.0f; // row_idx + 2
+    float partial_acc_2 = 0.0f; // row_idx + 2  
     float partial_acc_3 = 0.0f; // row_idx + 3
 
     for (int k_base = 0; k_base < IF_vec; k_base += BLOCK_DIM_X) {
         int k_vec = k_base + tx;
 
         if (k_vec < IF_vec) {
-            // Load 8 activations = 128 bits
-            int act_idx = k_vec * 8;
-            uint4 packed_acts =
-                __ldg(reinterpret_cast<const uint4*>(&activations[act_idx]));
+            // Load 4 activations
+            int act_idx = k_vec * 4;
+            uint64_t packed_acts =
+                __ldg(reinterpret_cast<const uint64_t*>(&activations[act_idx]));
             const half* h = reinterpret_cast<const half*>(&packed_acts);
 
+            // It might be better to load 8 activations at once and then we handle them by that we cut
+            // the memory wasting since we load 128-bit. So we need to consider what to do, because that was empirically
+            // Worse, probably because of register usage. This means that we might want 8 accumulators, which means
+            // handling packed quads (weight now not rows) contrary to duos rn. Although, we notice that we get L1 hits because the other threads in the warp
+            // will be loading the other activations that we need in the next iterations, so maybe it's not that bad.
             float act0 = __half2float(h[0]);
             float act1 = __half2float(h[1]);
             float act2 = __half2float(h[2]);
             float act3 = __half2float(h[3]);
-            float act4 = __half2float(h[4]);
-            float act5 = __half2float(h[5]);
-            float act6 = __half2float(h[6]);
-            float act7 = __half2float(h[7]);
 
-            // Load 2 packed rows, but now each load is 64-bit
-            uint64_t w_chunk_0 = W_vec[current_of_packed_0 * IF_vec + k_vec];
-            uint64_t w_chunk_1 = W_vec[current_of_packed_1 * IF_vec + k_vec];
+            // Load 2 packed rows we assume second exists, since we assume OF is divisible by 4 
+            // we load 32-bits, which mean we load 4 weights for 2 rows at once, so we can save some memory bandwidth. We will need to unpack them into 4-bit values though.
+            // This is 8 weights, but notice that we have two rows in a chunk so 4 weights for row.
+            // We might want to load 64-bits, which means 16 weights, 8 for a row. that makes here a bit better,
+            // And then we will load 128-bit activations.
+            // We cant load them togther, because they are not continguous, we might want to chage that.
+            uint32_t w_chunk_0 = W_vec[current_of_packed_0 * IF_vec + k_vec];
+            uint32_t  w_chunk_1 = W_vec[current_of_packed_1 * IF_vec + k_vec];
 
-            // Each warp-step covers 32 * 8 = 256 features
-            constexpr int GROUP_SHIFT = 8; // log2(256)
-            int group_idx = (k_vec * 8) >> GROUP_SHIFT;
+            // int group_idx = (k_vec * 4) / group_size; // Calculate group index for scaling factors and zeros
+            // We assume group_size = 128 for this kernel so
+            constexpr int GROUP_SHIFT = 7; // for 128
+            int group_idx = (k_vec * 4) >> GROUP_SHIFT;
 
             // Load [s0,z0,s1,z1,s2,z2,s3,z3] for 4 rows
             int base_half = group_idx * (2 * OF) + 2 * row_idx;
@@ -82,15 +87,9 @@ __global__ void w4a16_gemv_vectorized_kernel(
             float z_val_3 = __half2float(vals[7]);
 
             #pragma unroll
-            for (int step = 0; step < 8; step++) {
+            for (int step = 0; step < 4; step++) {
                 float act_val =
-                    (step == 0 ? act0 :
-                     step == 1 ? act1 :
-                     step == 2 ? act2 :
-                     step == 3 ? act3 :
-                     step == 4 ? act4 :
-                     step == 5 ? act5 :
-                     step == 6 ? act6 : act7);
+                    (step == 0 ? act0 : step == 1 ? act1 : step == 2 ? act2 : act3);
 
                 // First packed row -> rows row_idx, row_idx+1
                 uint8_t w_packed_val_0 = (w_chunk_0 >> (step * 8)) & 0xFF;
@@ -126,8 +125,17 @@ __global__ void w4a16_gemv_vectorized_kernel(
         partial_acc_2 += __shfl_down_sync(0xffffffff, partial_acc_2, offset);
         partial_acc_3 += __shfl_down_sync(0xffffffff, partial_acc_3, offset);
     }
-
+    // Since we have BLOCK_DIM_X = 32 threads for this kernel 1 warp
+    
     if (tx == 0) {
+        // Notice this branching will cause "Stall Branching"
+        // we obviously ignore it here.
+
+
+        // Store first 2 rows
+        // and then store the Store next 2 rows if valid
+        // we assume validity because OF is divisible by 4 in our benchmarks
+        // let's still check though
         if (row_idx + 3 < OF) {
             const uint2 bias_pack = __ldg(reinterpret_cast<const uint2*>(&b[row_idx]));
             const half* bias_h = reinterpret_cast<const half*>(&bias_pack);
@@ -181,7 +189,7 @@ torch::Tensor w4a16_forward(
                 "W_packed and activations must be on the same CUDA device");
 
     TORCH_CHECK(W_packed.dim() == 2,
-                "W_packed must be a 2D tensor");
+                "W_packed must be a 2D tensor of shape [OF_packed, IF]");
     TORCH_CHECK(activations.dim() == 2,
                 "activations must be a 2D tensor of shape [IF, B]");
     TORCH_CHECK(
@@ -191,21 +199,21 @@ torch::Tensor w4a16_forward(
                 "SZ must be a 2D tensor of shape [IF / group_size, 2 * OF]");
 
     TORCH_CHECK(group_size > 0, "group_size must be > 0");
-    TORCH_CHECK(group_size == 256,
-                "This optimized kernel currently requires group_size == 256");
+    TORCH_CHECK(group_size == 128,
+            "This optimized kernel currently requires group_size == 128");
 
     int64_t OF_packed = W_packed.size(0);
     int64_t IF = W_packed.size(1);
-    int64_t OF = OF_packed * 2;
     int64_t B = activations.size(1);
-    
+    int64_t OF = OF_packed * 2;
+
     TORCH_CHECK((OF % 4) == 0,
-                "This optimized kernel currently requires OF to be divisible by 4");
+            "This optimized kernel currently requires OF to be divisible by 4");
     TORCH_CHECK(OF_packed > 0, "W_packed.size(0) must be > 0");
-    TORCH_CHECK(IF > 0, "Input features must be > 0");
+    TORCH_CHECK(IF > 0, "W_packed.size(1) must be > 0");
     TORCH_CHECK(B == 1, "This optimized kernel strictly requires Batch Size B=1");
-    TORCH_CHECK(IF % 8 == 0,
-                "Input Features must be a multiple of 8 for 64-bit vectorization");
+    TORCH_CHECK(IF % 4 == 0,
+                "Input Features must be a multiple of 4 for 32-bit vectorization");
     TORCH_CHECK(IF % group_size == 0,
                 "Input Features must be divisible by group_size");
 
@@ -217,7 +225,7 @@ torch::Tensor w4a16_forward(
 
     dim3 threads(BLOCK_DIM_X, BLOCK_DIM_Y);
 
-    // Each ty still handles 2 packed rows
+    // Each ty now handles 2 packed rows
     int64_t OF_packed_pairs = (OF_packed + 1) / 2;
     dim3 blocks((OF_packed_pairs + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
 

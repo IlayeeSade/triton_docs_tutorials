@@ -73,3 +73,85 @@ Global Memory (DRAM)
 Achieved occupancy might be lower than theoretical because it counts activate number of warps which are not stalled. This practically means that warp stall causes discrepencies.
 
 Branching is pretty cheap.
+
+
+| Layer | What it Represents | Unit Size | Who Controls It | What It Means | Example |
+|------|------|------|------|------|------|
+| Thread Instruction Load | The amount of data a **single thread loads in one instruction** | e.g. 32-bit, 64-bit, 128-bit | Your code / compiler | Determines how many bytes a thread requests at once | `float`, `float2`, `float4`, `uint4` |
+| Warp Memory Transaction | The **actual memory transfer done by the GPU memory system** | Usually **128 bytes** | GPU hardware | The warp's requests are merged and served in 128-byte segments | A warp loading 32×4 bytes |
+
+---
+
+# Warp Coalescing Dilemma
+
+| Scenario | Thread Access Pattern | Warp Address Pattern | Transactions Needed | Performance | Explanation |
+|------|------|------|------|------|------|
+| Bad Case | Each thread loads 4 bytes but from unrelated locations | Addresses are scattered across memory | Up to **32 transactions** | ❌ Very Slow | Each thread touches a different 128-byte segment, so the GPU must fetch many memory lines |
+| Good Case | Each thread loads 4 bytes that are unrelated within the thread | But **all 32 threads together cover a contiguous 128-byte region** | **1 transaction** | ✅ Fast | The warp accesses a single contiguous cache line, so the GPU serves everything with one memory fetch |
+
+---
+
+# Key Insight
+
+The GPU optimizes **warp memory access**, not individual thread locality.
+
+So the important rule is:
+
+
+Make the warp access contiguous memory.
+
+
+It **does not matter** if a single thread's accesses are internally contiguous, as long as:
+
+
+the combined warp request fits into few 128-byte segments.
+
+
+---
+
+# Practical Rule for CUDA Kernels
+
+Best pattern:
+
+
+thread_i → base + i * element_size
+
+
+Example:
+
+
+thread0 → A[0]
+thread1 → A[1]
+thread2 → A[2]
+...
+thread31 → A[31]
+
+
+Worst pattern:
+
+
+thread_i → base + i * large_stride
+
+
+Example:
+
+
+thread0 → A[0]
+thread1 → A[1024]
+thread2 → A[2048]
+...
+
+
+---
+
+# Short Summary
+
+| Question | Answer |
+|------|------|
+| Should each thread access contiguous memory? | Not necessary |
+| Should the **warp** access contiguous memory? | **Yes (critical)** |
+| What determines memory performance? | Number of **128-byte memory transactions** |
+
+
+Cloascing does not happen over threads blocks, but it might improve L2 hits.
+Memory coalescing happens per warp, so contiguity between warps generally does not improve coalescing. 
