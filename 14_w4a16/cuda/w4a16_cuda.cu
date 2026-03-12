@@ -12,13 +12,14 @@ __global__ void w4a16_gemv_vectorized_kernel(
     const __nv_bfloat16* __restrict__ SZ,
     const __nv_bfloat16* __restrict__ activations,
     __nv_bfloat16* __restrict__ OUT,
-    int OF, int IF, int group_size)
+    int OF, int IF, int group_size, int group_shift)
 {
     static_assert(BLOCK_DIM_X % 32 == 0, "BLOCK_DIM_X must be a multiple of warp size");
 
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_TX = BLOCK_DIM_X / WARP_SIZE;
-    constexpr int GROUP_SHIFT = 6; // log2(64)
+
+    int GROUP_SHIFT = group_shift;
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -33,7 +34,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
     if (packed_row_idx >= OF_packed) return;
 
     const uint4* W_vec = reinterpret_cast<const uint4*>(W_packed);
-    int IF_vec = IF >> 3; // IF / 8
+    int IF_vec = IF >> 3;
 
     float partial_acc_0 = 0.0f;
     float partial_acc_1 = 0.0f;
@@ -285,11 +286,21 @@ torch::Tensor w4a16_forward(
     int64_t OF = OF_packed * 4;
     int64_t B = activations.size(1);
 
+    TORCH_CHECK(IF % group_size == 0,
+                "IF (", IF, ") must be divisible by group_size (", group_size, ")");
+
     auto options = torch::TensorOptions()
                        .dtype(torch::kBFloat16)
                        .device(W_packed.device());
 
     auto OUT = torch::empty({OF, B}, options);
+
+    int group_shift = 0;
+    int temp = group_size;
+    while (temp > 1) {
+        temp >>= 1;
+        group_shift++;
+    }
 
     dim3 threads(BLOCK_DIM_X, BLOCK_DIM_Y);
     dim3 blocks((OF_packed + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
@@ -302,7 +313,8 @@ torch::Tensor w4a16_forward(
         reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr<at::BFloat16>()),
         static_cast<int>(OF),
         static_cast<int>(IF),
-        group_size
+        group_size,
+        group_shift
     );
 
     cudaError_t err = cudaGetLastError();
