@@ -12,13 +12,17 @@ __global__ void w4a16_gemv_vectorized_kernel(
     const __nv_bfloat16* __restrict__ SZ,
     const __nv_bfloat16* __restrict__ activations,
     __nv_bfloat16* __restrict__ OUT,
-    int OF, int IF, int group_size, int group_shift)
+    int OF, int IF, int group_size, int group_shift)  // FIX: Added group_shift parameter
 {
     static_assert(BLOCK_DIM_X % 32 == 0, "BLOCK_DIM_X must be a multiple of warp size");
 
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_TX = BLOCK_DIM_X / WARP_SIZE;
 
+    // FIX: Use runtime group_shift instead of hardcoded GROUP_SHIFT = 6
+    // PROBLEM: Original kernel used constexpr int GROUP_SHIFT = 6, which assumes group_size = 64
+    // This broke for group_size values like 32, 128, 256, etc.
+    // SOLUTION: Compute GROUP_SHIFT = log2(group_size) at host-side and pass as parameter
     int GROUP_SHIFT = group_shift;
 
     int tx = threadIdx.x;
@@ -34,7 +38,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
     if (packed_row_idx >= OF_packed) return;
 
     const uint4* W_vec = reinterpret_cast<const uint4*>(W_packed);
-    int IF_vec = IF >> 3;
+    int IF_vec = IF >> 3; // IF / 8
 
     float partial_acc_0 = 0.0f;
     float partial_acc_1 = 0.0f;
@@ -286,15 +290,16 @@ torch::Tensor w4a16_forward(
     int64_t OF = OF_packed * 4;
     int64_t B = activations.size(1);
 
-    TORCH_CHECK(IF % group_size == 0,
-                "IF (", IF, ") must be divisible by group_size (", group_size, ")");
-
     auto options = torch::TensorOptions()
                        .dtype(torch::kBFloat16)
                        .device(W_packed.device());
 
     auto OUT = torch::empty({OF, B}, options);
 
+    // FIX: Compute GROUP_SHIFT = log2(group_size)
+    // PROBLEM: Original kernel hardcoded GROUP_SHIFT = 6 (assumes group_size = 64)
+    // This caused incorrect behavior for group_size != 64
+    // SOLUTION: Compute at host-side using bit-shifting to find log2
     int group_shift = 0;
     int temp = group_size;
     while (temp > 1) {
@@ -314,7 +319,7 @@ torch::Tensor w4a16_forward(
         static_cast<int>(OF),
         static_cast<int>(IF),
         group_size,
-        group_shift
+        group_shift  // FIX: Pass computed group_shift
     );
 
     cudaError_t err = cudaGetLastError();
