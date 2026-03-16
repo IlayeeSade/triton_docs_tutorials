@@ -1,0 +1,25 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "Win64-CUDA-PyTorch",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/Users/elais/AppData/Local/Programs/Python/Python312/Lib/site-packages/torch/include",
+        "C:/Users/elais/AppData/Local/Programs/Python/Python312/Lib/site-packages/torch/include/torch/csrc/api/include",
+        "C:/Users/elais/AppData/Local/Programs/Python/Python312/Lib/site-packages/torch/include/TH",
+        "C:/Users/elais/AppData/Local/Programs/Python/Python312/Lib/site-packages/torch/include/THC",
+        "${env:CUDA_PATH}/include"
+      ],
+      "defines": [
+        "_DEBUG",
+        "UNICODE",
+        "_UNICODE"
+      ],
+      "compilerPath": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe",
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-msvc-x64"
+    }
+  ]
+}
